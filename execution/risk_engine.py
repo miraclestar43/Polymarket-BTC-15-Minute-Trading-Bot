@@ -9,6 +9,123 @@ from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
 
+from config import get_config
+
+
+# ---------------------------------------------------------------------------
+# Kelly Criterion Position Sizing
+# ---------------------------------------------------------------------------
+
+def calculate_kelly_size(
+    probability: Optional[float],
+    odds_b: Optional[float],
+    bankroll: float = 100.0,
+    kelly_fraction_cap: float = 0.05,
+    min_bet: float = 1.00,
+    max_bet: float = 50.00,
+) -> tuple[Decimal, str]:
+    """
+    Calculate position size using Kelly criterion.
+
+    Formula: f* = p_model - (1-p_model)/b
+
+    Where:
+      p_model = strategy/model-estimated probability of success (NOT market price)
+      b = net odds ratio derived from entry price
+
+    For binary markets (odds derived from entry_price):
+      BUY YES at entry_price c:  b = (1-c)/c
+      BUY NO  at entry_price c:  b = c/(1-c)
+
+    The caller MUST provide p_model from the strategy/model, not from market price.
+    Market price is only used to compute odds (b) via odds_from_price().
+
+    Args:
+        probability: Model-estimated probability of success (0.0-1.0).
+                     This is p_model, NOT the market price.
+                     None or invalid → no trade.
+        odds_b: Net odds ratio derived from entry price. None or <= 0 → no trade.
+        bankroll: Total bankroll in USD.
+        kelly_fraction_cap: Maximum fraction of bankroll to bet.
+        min_bet: Minimum bet size in USD.
+        max_bet: Maximum bet size in USD.
+
+    Returns:
+        (size_usd, reason) — size in USD and human-readable reason.
+        size_usd of 0 means no trade.
+    """
+    # --- Validate inputs ---
+    if probability is None or not isinstance(probability, (int, float)):
+        return Decimal("0"), "missing_probability_for_kelly"
+
+    if not (0.0 < probability < 1.0):
+        return Decimal("0"), f"invalid_probability_{probability}"
+
+    if odds_b is None or not isinstance(odds_b, (int, float)):
+        return Decimal("0"), "missing_odds_for_kelly"
+
+    if odds_b <= 0:
+        return Decimal("0"), f"invalid_odds_{odds_b}"
+
+    if bankroll <= 0:
+        return Decimal("0"), "invalid_bankroll"
+
+    # --- Kelly formula: f* = p - (1-p)/b ---
+    p = probability
+    b = odds_b
+    kelly_raw = p - (1.0 - p) / b
+
+    # Clamp negative Kelly to 0 (no bet when edge is negative)
+    if kelly_raw <= 0:
+        return Decimal("0"), f"negative_kelly_{kelly_raw:.4f}_no_edge"
+
+    # Cap Kelly fraction
+    kelly_capped = min(kelly_raw, kelly_fraction_cap)
+
+    # Convert to dollar size
+    size_usd = bankroll * kelly_capped
+
+    # Enforce min/max bounds
+    reason = f"kelly_{kelly_raw:.4f}_capped_{kelly_capped:.4f}"
+
+    if size_usd < min_bet:
+        # Kelly says bet less than minimum — use min_bet in dry-run context
+        # but log the reason so the caller knows it's a floor, not a true Kelly size
+        size_usd = min_bet
+        reason += f"_floored_to_min_{min_bet:.2f}"
+
+    if size_usd > max_bet:
+        size_usd = max_bet
+        reason += f"_capped_to_max_{max_bet:.2f}"
+
+    return Decimal(str(round(size_usd, 2))), reason
+
+
+def odds_from_price(price: float, side: str = "long") -> Optional[float]:
+    """
+    Calculate net odds ratio from binary market price.
+
+    For BUY YES (long) at price c:  b = (1-c)/c
+    For BUY NO (short) at price c:  b = c/(1-c)
+
+    Args:
+        price: Market price (0.0-1.0)
+        side: "long" for BUY YES, "short" for BUY NO
+
+    Returns:
+        Odds ratio b, or None if price is invalid.
+    """
+    if not isinstance(price, (int, float)) or price <= 0 or price >= 1:
+        return None
+
+    if side == "long":
+        return (1.0 - price) / price
+    elif side == "short":
+        return price / (1.0 - price)
+    else:
+        return None
+
+
 
 class RiskLevel(Enum):
     """Risk level classification."""
@@ -63,17 +180,23 @@ class RiskEngine:
         Initialize risk engine.
         
         Args:
-            limits: Risk limits configuration
+            limits: Risk limits configuration. If None, loads from strategy config.
         """
-        # Default conservative limits with $1 max per trade
-        self.limits = limits or RiskLimits(
-            max_position_size=Decimal("1.0"),  # $1 max per position
-            max_total_exposure=Decimal("10.0"),  # $10 total
-            max_positions=5,
-            max_drawdown_pct=0.15,  # 15% max drawdown
-            max_loss_per_day=Decimal("5.0"),  # $5 daily loss limit
-            max_leverage=1.0,
-        )
+        # Load from strategy config if not provided
+        if limits is None:
+            config = get_config()
+            max_bet = Decimal(str(config.get("max_bet", 50.00)))
+            bankroll = Decimal(str(config.get("bankroll", 100.00)))
+            self.limits = RiskLimits(
+                max_position_size=max_bet,
+                max_total_exposure=bankroll * Decimal("0.50"),  # 50% of bankroll max
+                max_positions=5,
+                max_drawdown_pct=0.15,
+                max_loss_per_day=bankroll * Decimal("0.05"),  # 5% daily loss limit
+                max_leverage=1.0,
+            )
+        else:
+            self.limits = limits
         
         # Track positions
         self._positions: Dict[str, PositionRisk] = {}
@@ -89,7 +212,7 @@ class RiskEngine:
         
         logger.info(
             f"Initialized Risk Engine: "
-            f"max_position=${self.limits.max_position_size}, "
+            f"max_bet=${self.limits.max_position_size}, "
             f"max_exposure=${self.limits.max_total_exposure}"
         )
     

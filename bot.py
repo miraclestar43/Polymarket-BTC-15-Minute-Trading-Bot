@@ -66,6 +66,7 @@ from core.strategy_brain.signal_processors.tick_velocity_processor import TickVe
 from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 from execution.risk_engine import get_risk_engine
+from execution.risk_engine import calculate_kelly_size, odds_from_price
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
@@ -848,11 +849,15 @@ class IntegratedBTCStrategy(Strategy):
 
     async def _make_trading_decision(self, current_price: Decimal):
         """
-        Make trading decision using our 7-phase system.
+        Make trading decision using our 7-phase system with Kelly sizing.
 
-        Position size is always $1.00 — no variable sizing, no risk-engine
-        calculation needed. The risk engine is still used to check that we
-        don't already have too many open positions.
+        Position size is calculated using the Kelly criterion:
+          f* = p_model - (1-p_model)/b
+        where:
+          p_model = strategy/model-estimated probability of success (from fused signals)
+          b = net odds ratio derived from entry price
+
+        The risk engine still enforces position-count and exposure limits.
         """
         # --- Mode check ---
         is_simulation = await self.check_simulation_mode()
@@ -896,8 +901,24 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size from strategy config ---
+        # --- Phase 5: Kelly criterion position sizing ---
+        # Kelly formula: f* = p_model - (1-p_model)/b
+        #
+        # CRITICAL DISTINCTION:
+        #   p_model = strategy/model-estimated probability of success (from fused signals)
+        #   entry_price = market price (what we pay, used to compute odds b)
+        #   b = net odds ratio derived from entry_price
+        #
+        # For BUY YES:  b = (1 - entry_price) / entry_price
+        # For BUY NO:   b = entry_price / (1 - entry_price)
+        #
+        # Kelly only bets when p_model implies edge over the market's implied probability.
+
+        price_float = float(current_price)
+
+        # --- Phase 5a: Position size from strategy config (fallback) ---
         position_size = Decimal(str(self.config.get("min_bet", 1.00)))
+        kelly_reason = "fallback_min_bet"
 
         # =========================================================================
         # TREND FILTER — replaces signal-based direction at the late trade window
@@ -936,6 +957,74 @@ class IntegratedBTCStrategy(Strategy):
                 f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
             )
             return
+
+        # --- Phase 5b: Calculate Kelly size ---
+        # p_model = strategy/model-estimated probability (from fused signal confidence)
+        # entry_price = market price (used to compute odds, NOT as p_model)
+        # b = odds from entry_price
+        #
+        # For BUY YES: p_model = fused.confidence, b = (1-entry_price)/entry_price
+        # For BUY NO:  p_model = fused.confidence, b = entry_price/(1-entry_price)
+        #
+        # When p_model > entry_price (YES) or p_model > (1-entry_price) (NO),
+        # Kelly detects edge and sizes accordingly.
+
+        entry_price = price_float
+
+        # Odds from entry price
+        if direction == "long":
+            kelly_odds = odds_from_price(entry_price, side="long")
+        else:
+            kelly_odds = odds_from_price(entry_price, side="short")
+
+        # Model probability from fused signal confidence
+        # This is the strategy's estimate, NOT derived from market price
+        kelly_p_model = fused.confidence if fused.confidence is not None else None
+
+        # Validate p_model is usable
+        if kelly_p_model is None or not (0.0 < kelly_p_model < 1.0):
+            # No model probability available — safe fallback
+            if is_simulation:
+                # In dry-run, use min_bet so we can observe Kelly behavior
+                kelly_reason = "dry_run_min_bet_missing_model_probability"
+                logger.info(
+                    f"⏭ KELLY: Missing/invalid p_model ({kelly_p_model}) — "
+                    f"dry-run fallback to min_bet"
+                )
+            else:
+                # Live: skip trade entirely
+                kelly_reason = "missing_model_probability_for_kelly"
+                logger.info(
+                    f"⏭ KELLY: Missing/invalid p_model ({kelly_p_model}) — "
+                    f"skipping trade (live mode)"
+                )
+                return
+
+        kelly_size, kelly_reason = calculate_kelly_size(
+            probability=kelly_p_model,
+            odds_b=kelly_odds,
+            bankroll=self.config.get("bankroll", 100.0),
+            kelly_fraction_cap=self.config.get("kelly_fraction_cap", 0.05),
+            min_bet=self.config.get("min_bet", 1.00),
+            max_bet=self.config.get("max_bet", 50.00),
+        )
+
+        # TODO(phase_fee_aware): Add fee-aware EV adjustment here
+        # Current: raw Kelly without fee consideration
+        # Future: adjust probability downward by estimated fee impact
+
+        if kelly_size <= 0:
+            logger.info(
+                f"⏭ KELLY: No edge (size=$0, reason={kelly_reason}) — skipping trade"
+            )
+            return
+
+        position_size = kelly_size
+
+        logger.info(
+            f"Kelly sizing: entry_price={entry_price:.4f}, p_model={kelly_p_model:.4f}, "
+            f"b={kelly_odds:.4f}, size=${float(position_size):.2f}, reason={kelly_reason}"
+        )
 
         # Risk engine: only check position-count / exposure limits (no sizing math)
         is_valid, error = self.risk_engine.validate_new_position(
