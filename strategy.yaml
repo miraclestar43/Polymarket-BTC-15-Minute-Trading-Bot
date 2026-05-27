@@ -24,3 +24,15 @@ journal_path: "logs/trade_journal"
 telegram_enabled: true
 telegram_trade_alerts: false
 telegram_daily_summary: true
+
+# Nightly review
+nightly_review_enabled: true
+nightly_review_time: "00:00"
+
+# Strategy auto-update safety bounds
+min_prob_min: 0.82
+min_prob_max: 0.95
+min_prob_daily_step: 0.02
+kelly_fraction_cap_min: 0.01
+kelly_fraction_cap_max: 0.10
+kelly_fraction_cap_daily_step: 0.01
