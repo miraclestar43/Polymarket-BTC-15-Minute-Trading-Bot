@@ -1,0 +1,8 @@
+dry_run: true
+min_edge: 0.05
+min_prob: 0.87
+min_bet: 1.00
+max_bet: 50.00
+bankroll: 100.00
+kelly_fraction_cap: 0.05
+auto_update_enabled: false
