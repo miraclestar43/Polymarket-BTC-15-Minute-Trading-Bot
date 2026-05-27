@@ -68,6 +68,7 @@ from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 from execution.risk_engine import get_risk_engine
 from execution.risk_engine import calculate_kelly_size, odds_from_price
 from core.strategy_brain.signal_processors.markov_processor import get_markov_filter
+from journal.trade_journal import get_journal
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
@@ -217,6 +218,9 @@ class IntegratedBTCStrategy(Strategy):
 
         # Phase 4d: Markov Persistence Filter
         self.markov_filter = get_markov_filter()
+
+        # Phase 4e: Trade Journal
+        self.journal = get_journal()
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
@@ -932,6 +936,15 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(
                 f"⏭ MARKOV: {markov_result.reason} — skipping trade"
             )
+            self.journal.log_skipped_trade(
+                dry_run=is_simulation,
+                decision_reason=f"markov_persistence_below_threshold: {markov_result.reason}",
+                side=direction_str if direction_str in ("BULLISH", "BEARISH") else None,
+                entry_price=float(current_price),
+                markov_state=markov_result.current_state,
+                p_stay=markov_result.p_stay,
+                min_prob=markov_result.min_prob,
+            )
             return
 
         # --- Phase 5: Kelly criterion position sizing ---
@@ -989,6 +1002,13 @@ class IntegratedBTCStrategy(Strategy):
                 f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
                 f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
             )
+            self.journal.log_skipped_trade(
+                dry_run=is_simulation,
+                decision_reason="trend_neutral_price_near_0.50",
+                entry_price=price_float,
+                markov_state=markov_result.current_state,
+                p_stay=markov_result.p_stay,
+            )
             return
 
         # --- Phase 5b: Calculate Kelly size ---
@@ -1024,6 +1044,15 @@ class IntegratedBTCStrategy(Strategy):
                     f"⏭ KELLY: Missing/invalid p_model ({kelly_p_model}) — "
                     f"dry-run fallback to min_bet"
                 )
+                self.journal.log_skipped_trade(
+                    dry_run=True,
+                    decision_reason=kelly_reason,
+                    side="long" if direction == "long" else "short",
+                    entry_price=entry_price,
+                    p_model=kelly_p_model,
+                    markov_state=markov_result.current_state,
+                    p_stay=markov_result.p_stay,
+                )
             else:
                 # Live: skip trade entirely
                 kelly_reason = "missing_model_probability_for_kelly"
@@ -1050,6 +1079,17 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(
                 f"⏭ KELLY: No edge (size=$0, reason={kelly_reason}) — skipping trade"
             )
+            self.journal.log_skipped_trade(
+                dry_run=is_simulation,
+                decision_reason=f"kelly_no_edge: {kelly_reason}",
+                side="long" if direction == "long" else "short",
+                entry_price=entry_price,
+                p_model=kelly_p_model,
+                p_model_source="fused_confidence_proxy",
+                odds_b=kelly_odds,
+                markov_state=markov_result.current_state,
+                p_stay=markov_result.p_stay,
+            )
             return
 
         position_size = kelly_size
@@ -1069,9 +1109,38 @@ class IntegratedBTCStrategy(Strategy):
         )
         if not is_valid:
             logger.warning(f"Risk engine blocked trade: {error}")
+            self.journal.log_order_rejected(
+                dry_run=is_simulation,
+                decision_reason=f"risk_engine_blocked: {error}",
+                side="long" if direction == "long" else "short",
+                entry_price=entry_price,
+                size=float(position_size),
+                error_type="risk_engine_rejection",
+                error_message_sanitized=str(error)[:200],
+            )
             return
 
         logger.info(f"Position size: ${float(position_size):.2f} | Direction: {direction.upper()}")
+
+        # --- Journal: Full decision record ---
+        kelly_raw = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else None
+        kelly_capped = min(kelly_raw, self.config.get("kelly_fraction_cap", 0.05)) if kelly_raw and kelly_raw > 0 else None
+        self.journal.log_decision(
+            dry_run=is_simulation,
+            side="long" if direction == "long" else "short",
+            entry_price=entry_price,
+            size=float(position_size),
+            p_model=kelly_p_model,
+            p_model_source="fused_confidence_proxy",
+            odds_b=kelly_odds,
+            raw_kelly_fraction=round(kelly_raw, 6) if kelly_raw is not None else None,
+            capped_kelly_fraction=round(kelly_capped, 6) if kelly_capped is not None else None,
+            kelly_size=float(position_size),
+            markov_state=markov_result.current_state,
+            p_stay=markov_result.p_stay,
+            min_prob=markov_result.min_prob,
+            decision_reason=f"trade_authorized: {kelly_reason}",
+        )
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -1085,11 +1154,25 @@ class IntegratedBTCStrategy(Strategy):
                 logger.warning(
                     f"⚠ No liquidity for BUY: ask=${float(last_ask):.4f} ≤ {float(MIN_LIQUIDITY):.2f} — skipping trade, will retry next tick"
                 )
+                self.journal.log_skipped_trade(
+                    dry_run=is_simulation,
+                    decision_reason=f"no_liquidity_ask={float(last_ask):.4f}",
+                    side="long",
+                    entry_price=entry_price,
+                    size=float(position_size),
+                )
                 self.last_trade_time = -1  # Allow retry next tick
                 return
             if direction == "short" and last_bid <= MIN_LIQUIDITY:
                 logger.warning(
                     f"⚠ No liquidity for SELL: bid=${float(last_bid):.4f} ≤ {float(MIN_LIQUIDITY):.2f} — skipping trade, will retry next tick"
+                )
+                self.journal.log_skipped_trade(
+                    dry_run=is_simulation,
+                    decision_reason=f"no_liquidity_bid={float(last_bid):.4f}",
+                    side="short",
+                    entry_price=entry_price,
+                    size=float(position_size),
                 )
                 self.last_trade_time = -1  # Allow retry next tick
                 return
@@ -1149,6 +1232,17 @@ class IntegratedBTCStrategy(Strategy):
         if hasattr(self, 'grafana_exporter') and self.grafana_exporter:
             self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
             self.grafana_exporter.record_trade_duration(exit_delta.total_seconds())
+
+        # Log simulated order to journal
+        self.journal.log_simulated_order(
+            dry_run=True,
+            side="long" if direction == "long" else "short",
+            entry_price=float(current_price),
+            size=float(position_size),
+            order_id=f"paper_{int(datetime.now().timestamp())}",
+            simulated_pnl=float(pnl),
+            mark_price=float(exit_price),
+        )
 
         logger.info("=" * 80)
         logger.info("[SIMULATION] PAPER TRADE RECORDED")
@@ -1416,10 +1510,13 @@ class IntegratedBTCStrategy(Strategy):
             import asyncio
             try:
                 loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 loop.run_until_complete(self.grafana_exporter.stop())
             except Exception:
                 pass
-
+        # Close journal
+        if self.journal:
+            self.journal.close()
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------

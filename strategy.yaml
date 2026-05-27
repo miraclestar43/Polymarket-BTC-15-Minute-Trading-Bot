@@ -17,7 +17,7 @@ signature_type: 1
 
 # Future phases (scaffolded, not yet implemented)
 markov_window: 20
-journal_path: "trade_journal.json"
+journal_path: "logs/trade_journal"
 
 # Telegram (secrets go in .env, not here)
 # telegram_bot_token and telegram_chat_id are read from .env
