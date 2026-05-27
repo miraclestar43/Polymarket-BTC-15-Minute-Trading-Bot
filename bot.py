@@ -144,8 +144,8 @@ class IntegratedBTCStrategy(Strategy):
         super().__init__()
 
         # Load strategy configuration from YAML (with safe defaults)
-        self.config = strategy_config or get_config()
-        log_config_safety(self.config)
+        self.strategy_config = strategy_config or get_config()
+        log_config_safety(self.strategy_config)
 
         self.bot_start_time = datetime.now(timezone.utc)
         self.restart_after_minutes = 90
@@ -257,9 +257,9 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  Phase 5: Risk engine ready")
         logger.info("  Phase 6: Performance tracking ready")
         logger.info("  Phase 7: Learning engine ready")
-        logger.info(f"  Position size: ${self.config.get('min_bet', 1.00):.2f} – ${self.config.get('max_bet', 50.00):.2f}")
-        logger.info(f"  Bankroll: ${self.config.get('bankroll', 100.00):.2f}")
-        logger.info(f"  DRY_RUN: {self.config.get('dry_run', True)}")
+        logger.info(f"  Position size: ${self.strategy_config.get('min_bet', 1.00):.2f} – ${self.strategy_config.get('max_bet', 50.00):.2f}")
+        logger.info(f"  Bankroll: ${self.strategy_config.get('bankroll', 100.00):.2f}")
+        logger.info(f"  DRY_RUN: {self.strategy_config.get('dry_run', True)}")
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
@@ -963,7 +963,7 @@ class IntegratedBTCStrategy(Strategy):
         price_float = float(current_price)
 
         # --- Phase 5a: Position size from strategy config (fallback) ---
-        position_size = Decimal(str(self.config.get("min_bet", 1.00)))
+        position_size = Decimal(str(self.strategy_config.get("min_bet", 1.00)))
         kelly_reason = "fallback_min_bet"
 
         # =========================================================================
@@ -1065,10 +1065,10 @@ class IntegratedBTCStrategy(Strategy):
         kelly_size, kelly_reason = calculate_kelly_size(
             probability=kelly_p_model,
             odds_b=kelly_odds,
-            bankroll=self.config.get("bankroll", 100.0),
-            kelly_fraction_cap=self.config.get("kelly_fraction_cap", 0.05),
-            min_bet=self.config.get("min_bet", 1.00),
-            max_bet=self.config.get("max_bet", 50.00),
+            bankroll=self.strategy_config.get("bankroll", 100.0),
+            kelly_fraction_cap=self.strategy_config.get("kelly_fraction_cap", 0.05),
+            min_bet=self.strategy_config.get("min_bet", 1.00),
+            max_bet=self.strategy_config.get("max_bet", 50.00),
         )
 
         # TODO(phase_fee_aware): Add fee-aware EV adjustment here
@@ -1124,7 +1124,7 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- Journal: Full decision record ---
         kelly_raw = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else None
-        kelly_capped = min(kelly_raw, self.config.get("kelly_fraction_cap", 0.05)) if kelly_raw and kelly_raw > 0 else None
+        kelly_capped = min(kelly_raw, self.strategy_config.get("kelly_fraction_cap", 0.05)) if kelly_raw and kelly_raw > 0 else None
         self.journal.log_decision(
             dry_run=is_simulation,
             side="long" if direction == "long" else "short",
