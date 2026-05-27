@@ -8,6 +8,7 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from loguru import logger
+from config import get_config, get_signature_type, get_funder_address, mask_address
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType as PolyOrderType
@@ -24,6 +25,11 @@ class PolymarketClient:
     - Live market data
     - Position tracking
     - Balance management
+    
+    Safety:
+    - DRY_RUN mode prevents real order placement
+    - LIVE_TRADING_ACK required for live trading
+    - Supports EOA, POLY_PROXY, and POLY_GNOSIS_SAFE signature types
     """
     
     def __init__(
@@ -34,6 +40,7 @@ class PolymarketClient:
         api_passphrase: Optional[str] = None,
         chain_id: int = 137,  # Polygon mainnet
         testnet: bool = False,
+        dry_run: Optional[bool] = None,
     ):
         """
         Initialize Polymarket client.
@@ -45,6 +52,7 @@ class PolymarketClient:
             api_passphrase: Polymarket API passphrase
             chain_id: 137 for Polygon mainnet, 80002 for Amoy testnet
             testnet: Use testnet mode
+            dry_run: If True, block all real order placement. Defaults to config value.
         """
         # Load from environment if not provided
         self.private_key = private_key or os.getenv("POLYMARKET_PK")
@@ -54,6 +62,21 @@ class PolymarketClient:
         
         self.chain_id = chain_id
         self.testnet = testnet
+        
+        # DRY_RUN safety: load from config if not explicitly provided
+        if dry_run is None:
+            config = get_config()
+            self.dry_run = config.get("dry_run", True)
+        else:
+            self.dry_run = dry_run
+        
+        # LIVE_TRADING_ACK: required for live trading
+        self._live_trading_ack = os.getenv("LIVE_TRADING_ACK", "").lower() == "true"
+        
+        # Signature type: EOA (1), POLY_PROXY (2), or POLY_GNOSIS_SAFE (3)
+        config = get_config()
+        self._signature_type = get_signature_type(config)
+        self._funder_address = get_funder_address(config)
         
         # Client instance
         self.client: Optional[ClobClient] = None
@@ -73,8 +96,10 @@ class PolymarketClient:
         if not self.api_key:
             logger.error("POLYMARKET_API_KEY not found in environment")
         
-        mode = "TESTNET" if testnet else "MAINNET"
+        mode = "DRY_RUN" if self.dry_run else ("TESTNET" if testnet else "MAINNET")
         logger.info(f"Initialized Polymarket Client [{mode}] Chain ID: {chain_id}")
+        if self._funder_address:
+            logger.info(f"  Proxy wallet: {mask_address(self._funder_address)} (sig_type={self._signature_type})")
     
     async def connect(self) -> bool:
         """
@@ -97,8 +122,8 @@ class PolymarketClient:
                 host="https://clob.polymarket.com" if not self.testnet else "https://clob-testnet.polymarket.com",
                 key=self.private_key,
                 chain_id=self.chain_id,
-                signature_type=1,  # EOA signature
-                funder=os.getenv("POLYMARKET_FUNDER"),  # Optional funder address
+                signature_type=self._signature_type,  # Configurable: 1=EOA, 2=PROXY, 3=GNOSIS_SAFE
+                funder=self._funder_address,  # Optional proxy wallet address
             )
             
             # Set API credentials for authenticated endpoints
@@ -114,7 +139,8 @@ class PolymarketClient:
             if balance is not None:
                 self._connected = True
                 logger.info(f"✓ Connected to Polymarket CLOB")
-                logger.info(f"  Balance: ${balance.get('USDC', 0):.2f} USDC")
+                collateral = balance.get('USDC', 0)
+                logger.info(f"  Collateral balance: ${collateral:.2f}")
                 return True
             else:
                 logger.error("Failed to verify connection")
@@ -244,6 +270,9 @@ class PolymarketClient:
         """
         Place order on market.
         
+        SAFETY: If dry_run=True, returns a simulated order ID without calling any API.
+        If live_trading_ack=False and dry_run=False, rejects the order.
+        
         Args:
             token_id: Token ID to trade
             side: "buy" or "sell"
@@ -252,8 +281,21 @@ class PolymarketClient:
             order_type: Order type (GTC, FOK, GTD)
             
         Returns:
-            Order ID if successful
+            Order ID if successful (real or simulated), None if rejected
         """
+        # SAFETY: DRY_RUN guard — never place real orders in dry run mode
+        if self.dry_run:
+            sim_id = f"dry_run_{int(datetime.now().timestamp())}_{side}_{token_id[:8]}"
+            logger.info(f"[DRY_RUN] Simulated order: {side.upper()} {size} @ {price or 'market'}")
+            logger.info(f"[DRY_RUN] Simulated order ID: {sim_id}")
+            return sim_id
+        
+        # SAFETY: LIVE_TRADING_ACK guard — require explicit acknowledgment
+        if not self._live_trading_ack:
+            logger.error("LIVE TRADING BLOCKED: LIVE_TRADING_ACK is not true in .env")
+            logger.error("Set LIVE_TRADING_ACK=true in .env to enable live trading.")
+            return None
+        
         if not self.client:
             logger.error("Client not connected")
             return None
@@ -415,10 +457,10 @@ class PolymarketClient:
     
     async def get_balance(self) -> Dict[str, Decimal]:
         """
-        Get account balance.
+        Get account collateral balance.
         
         Returns:
-            Balance dict with USDC and token balances
+            Balance dict with collateral and token balances
         """
         return await self._get_balance_internal() or {}
     
@@ -468,6 +510,7 @@ _polymarket_client_instance = None
 def get_polymarket_client(
     testnet: bool = False,
     force_new: bool = False,
+    dry_run: Optional[bool] = None,
 ) -> PolymarketClient:
     """
     Get singleton Polymarket client.
@@ -475,10 +518,11 @@ def get_polymarket_client(
     Args:
         testnet: Use testnet mode
         force_new: Force creation of new instance
+        dry_run: Override dry_run mode. If None, uses config value.
     """
     global _polymarket_client_instance
     
     if _polymarket_client_instance is None or force_new:
-        _polymarket_client_instance = PolymarketClient(testnet=testnet)
+        _polymarket_client_instance = PolymarketClient(testnet=testnet, dry_run=dry_run)
     
     return _polymarket_client_instance

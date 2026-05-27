@@ -86,22 +86,39 @@ class ExecutionEngine:
     5. Monitor fills
     6. Manage position
     7. Handle exits (stop loss, take profit)
+    
+    Safety:
+    - dry_run=True by default (no real orders)
+    - LIVE_TRADING_ACK required for live trading
+    - Configurable via strategy.yaml
     """
     
     def __init__(
         self,
         risk_engine: Optional[RiskEngine] = None,
-        dry_run: bool = True,  # Simulate orders without real execution
+        dry_run: Optional[bool] = None,
     ):
         """
         Initialize execution engine.
         
         Args:
             risk_engine: Risk management engine
-            dry_run: If True, simulate orders (no real trading)
+            dry_run: If True, simulate orders (no real trading).
+                     If None, loads from strategy config (defaults to True).
         """
         self.risk_engine = risk_engine or get_risk_engine()
-        self.dry_run = dry_run
+        
+        # DRY_RUN: load from config if not explicitly provided
+        if dry_run is None:
+            from config import get_config
+            config = get_config()
+            self.dry_run = config.get("dry_run", True)
+        else:
+            self.dry_run = dry_run
+        
+        # LIVE_TRADING_ACK: required for live trading
+        import os
+        self._live_trading_ack = os.getenv("LIVE_TRADING_ACK", "").lower() == "true"
         
         # Order tracking
         self._orders: Dict[str, Order] = {}
@@ -258,6 +275,13 @@ class ExecutionEngine:
         
         # In live mode, submit to Polymarket via Nautilus
         if not self.dry_run:
+            # SAFETY: require LIVE_TRADING_ACK for real orders
+            if not self._live_trading_ack:
+                logger.error("LIVE TRADING BLOCKED: LIVE_TRADING_ACK is not true in .env")
+                logger.error("Set LIVE_TRADING_ACK=true in .env to enable live trading.")
+                order.status = OrderStatus.REJECTED
+                return None
+            
             try:
                 from execution.nautilus_polymarket_integration import get_polymarket_integration
                 
@@ -518,8 +542,8 @@ class ExecutionEngine:
 _execution_engine_instance = None
 
 def get_execution_engine() -> ExecutionEngine:
-    """Get singleton execution engine."""
+    """Get singleton execution engine (dry_run loaded from strategy config)."""
     global _execution_engine_instance
     if _execution_engine_instance is None:
-        _execution_engine_instance = ExecutionEngine(dry_run=True)
+        _execution_engine_instance = ExecutionEngine(dry_run=None)  # None → loads from config
     return _execution_engine_instance

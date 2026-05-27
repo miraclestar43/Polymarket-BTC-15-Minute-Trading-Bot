@@ -6,3 +6,18 @@ max_bet: 50.00
 bankroll: 100.00
 kelly_fraction_cap: 0.05
 auto_update_enabled: false
+
+# Safety: must be true in .env to allow live trading
+live_trading_ack: false
+
+# Proxy wallet / Gnosis Safe support
+# Set SAFE_ADDRESS in .env for proxy wallet, or set signature_type here
+# 1 = EOA (default), 2 = POLY_PROXY, 3 = POLY_GNOSIS_SAFE
+signature_type: 1
+
+# Future phases (scaffolded, not yet implemented)
+markov_window: 20
+journal_path: "trade_journal.json"
+
+# Telegram (secrets go in .env, not here)
+# telegram_bot_token and telegram_chat_id are read from .env

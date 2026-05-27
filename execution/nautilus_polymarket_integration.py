@@ -94,18 +94,29 @@ class PolymarketBTCIntegration:
     
     def __init__(
         self,
-        simulation_mode: bool = True,
+        simulation_mode: Optional[bool] = None,
         btc_market_condition_id: Optional[str] = None,
     ):
         """
         Initialize Polymarket integration.
         
         Args:
-            simulation_mode: If True, don't place real orders
+            simulation_mode: If True, don't place real orders.
+                            If None, loads from strategy config (defaults to True).
             btc_market_condition_id: Polymarket condition ID for BTC market
         """
-        self.simulation_mode = simulation_mode
+        # DRY_RUN: load from config if not explicitly provided
+        if simulation_mode is None:
+            from config import get_config
+            config = get_config()
+            self.simulation_mode = config.get("dry_run", True)
+        else:
+            self.simulation_mode = simulation_mode
+        
         self.btc_market_condition_id = btc_market_condition_id
+        
+        # LIVE_TRADING_ACK: required for live trading
+        self._live_trading_ack = os.getenv("LIVE_TRADING_ACK", "").lower() == "true"
         
         # Nautilus components
         self.node: Optional[TradingNode] = None
@@ -303,6 +314,12 @@ class PolymarketBTCIntegration:
             logger.info(f"[SIMULATION] Would place {side.upper()} order for ${size_usd}")
             return f"sim_order_{datetime.now().timestamp()}"
         
+        # SAFETY: require LIVE_TRADING_ACK for real orders
+        if not self._live_trading_ack:
+            logger.error("LIVE TRADING BLOCKED: LIVE_TRADING_ACK is not true in .env")
+            logger.error("Set LIVE_TRADING_ACK=true in .env to enable live trading.")
+            return None
+        
         try:
             # Get instrument from cache
             instrument = self.node.cache.instrument(self.btc_instrument_id)
@@ -400,6 +417,12 @@ class PolymarketBTCIntegration:
             logger.info(f"[SIMULATION] Would place {side.upper()} limit @ ${limit_price:.4f}")
             return f"sim_order_{datetime.now().timestamp()}"
         
+        # SAFETY: require LIVE_TRADING_ACK for real orders
+        if not self._live_trading_ack:
+            logger.error("LIVE TRADING BLOCKED: LIVE_TRADING_ACK is not true in .env")
+            logger.error("Set LIVE_TRADING_ACK=true in .env to enable live trading.")
+            return None
+        
         try:
             instrument = self.node.cache.instrument(self.btc_instrument_id)
             
@@ -457,18 +480,18 @@ class PolymarketBTCIntegration:
         return list(self.node.cache.positions_open())
     
     def get_balance(self) -> Dict[str, Any]:
-        """Get account balance."""
+        """Get account collateral balance."""
         if not self.node:
-            return {"USDC": 0.0}
+            return {"collateral": 0.0, "free": 0.0, "locked": 0.0}
         
         # Get account state from Nautilus cache
         account = self.node.cache.account(self.node.trader.id.get_tag())
         
         if not account:
-            return {"USDC": 0.0}
+            return {"collateral": 0.0, "free": 0.0, "locked": 0.0}
         
         return {
-            "USDC": float(account.balance_total().as_decimal()),
+            "collateral": float(account.balance_total().as_decimal()),
             "free": float(account.balance_free().as_decimal()),
             "locked": float(account.balance_locked().as_decimal()),
         }
@@ -499,10 +522,10 @@ class PolymarketBTCIntegration:
 _integration_instance: Optional[PolymarketBTCIntegration] = None
 
 def get_polymarket_integration(
-    simulation_mode: bool = True,
+    simulation_mode: Optional[bool] = None,
     btc_market_condition_id: Optional[str] = None,
 ) -> PolymarketBTCIntegration:
-    """Get singleton Polymarket integration."""
+    """Get singleton Polymarket integration (simulation_mode loaded from strategy config)."""
     global _integration_instance
     
     if _integration_instance is None:

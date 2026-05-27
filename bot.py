@@ -56,7 +56,7 @@ from nautilus_trader.model.data import QuoteTick
 from dotenv import load_dotenv
 from loguru import logger
 import redis
-
+from config import load_strategy_config, get_config, log_config_safety, get_signature_type, get_funder_address
 # Import our phases
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
 from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
@@ -137,8 +137,12 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, strategy_config=None):
         super().__init__()
+
+        # Load strategy configuration from YAML (with safe defaults)
+        self.config = strategy_config or get_config()
+        log_config_safety(self.config)
 
         self.bot_start_time = datetime.now(timezone.utc)
         self.restart_after_minutes = 90
@@ -244,7 +248,9 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  Phase 5: Risk engine ready")
         logger.info("  Phase 6: Performance tracking ready")
         logger.info("  Phase 7: Learning engine ready")
-        logger.info("  $1 per trade maximum")
+        logger.info(f"  Position size: ${self.config.get('min_bet', 1.00):.2f} – ${self.config.get('max_bet', 50.00):.2f}")
+        logger.info(f"  Bankroll: ${self.config.get('bankroll', 100.00):.2f}")
+        logger.info(f"  DRY_RUN: {self.config.get('dry_run', True)}")
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
@@ -752,16 +758,6 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _make_trading_decision_sync(self, current_price):
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
-    
-    def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
         # Convert float back to Decimal for processing
         from decimal import Decimal
@@ -900,8 +896,8 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
+        # --- Phase 5: Position size from strategy config ---
+        position_size = Decimal(str(self.config.get("min_bet", 1.00)))
 
         # =========================================================================
         # TREND FILTER — replaces signal-based direction at the late trade window
@@ -943,7 +939,7 @@ class IntegratedBTCStrategy(Strategy):
 
         # Risk engine: only check position-count / exposure limits (no sizing math)
         is_valid, error = self.risk_engine.validate_new_position(
-            size=POSITION_SIZE_USD,
+            size=position_size,
             direction=direction,
             current_price=current_price,
         )
@@ -951,7 +947,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked trade: {error}")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(f"Position size: ${float(position_size):.2f} | Direction: {direction.upper()}")
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -976,9 +972,9 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
-            await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+            await self._record_paper_trade(fused, position_size, current_price, direction)
         else:
-            await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
+            await self._place_real_order(fused, position_size, current_price, direction)
             
     async def _record_paper_trade(self, signal, position_size, current_price, direction):
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
@@ -1312,6 +1308,18 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
 
+    # Load strategy configuration from YAML
+    strategy_config = get_config(overrides={"dry_run": simulation})
+    log_config_safety(strategy_config)
+
+    # Verify safety gates
+    if not strategy_config.get("dry_run", True):
+        if not strategy_config.get("live_trading_ack", False):
+            logger.error("LIVE TRADING BLOCKED: LIVE_TRADING_ACK is not true in .env")
+            logger.error("Set LIVE_TRADING_ACK=true in .env to enable live trading.")
+            return
+        logger.warning("LIVE TRADING MODE — LIVE_TRADING_ACK confirmed.")
+
     redis_client = init_redis()
 
     if redis_client:
@@ -1373,7 +1381,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_key=os.getenv("POLYMARKET_API_KEY"),
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        signature_type=get_signature_type(strategy_config),
         instrument_provider=instrument_cfg,
     )
 
@@ -1382,7 +1390,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_key=os.getenv("POLYMARKET_API_KEY"),
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        signature_type=get_signature_type(strategy_config),
         instrument_provider=instrument_cfg,
     )
 
@@ -1404,6 +1412,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
+        strategy_config=strategy_config,
     )
 
     print("\nBuilding Nautilus node...")
