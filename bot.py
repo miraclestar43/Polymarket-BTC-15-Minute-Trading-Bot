@@ -67,6 +67,7 @@ from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitP
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 from execution.risk_engine import get_risk_engine
 from execution.risk_engine import calculate_kelly_size, odds_from_price
+from core.strategy_brain.signal_processors.markov_processor import get_markov_filter
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
@@ -213,6 +214,9 @@ class IntegratedBTCStrategy(Strategy):
         self.fusion_engine.set_weight("SpikeDetection",     0.12)  # mean reversion
         self.fusion_engine.set_weight("DeribitPCR",         0.10)  # institutional sentiment
         self.fusion_engine.set_weight("SentimentAnalysis",  0.05)  # daily F&G (weak)
+
+        # Phase 4d: Markov Persistence Filter
+        self.markov_filter = get_markov_filter()
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
@@ -901,6 +905,35 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
+        # --- Phase 4d: Markov Persistence Filter ---
+        # Observe this direction and check persistence before allowing trade.
+        # p(j*,j*) must >= min_prob (default 0.87) to proceed.
+        direction_str = str(fused.direction).upper()
+        if "BULLISH" in direction_str:
+            markov_observed_state = "BULLISH"
+        elif "BEARISH" in direction_str:
+            markov_observed_state = "BEARISH"
+        else:
+            markov_observed_state = "NEUTRAL"
+
+        if markov_observed_state in ("BULLISH", "BEARISH"):
+            self.markov_filter.observe(markov_observed_state)
+
+        markov_result = self.markov_filter.evaluate()
+
+        logger.info(
+            f"Markov: state={markov_result.current_state}, "
+            f"p_stay={markov_result.p_stay:.4f}, "
+            f"min_prob={markov_result.min_prob:.4f}, "
+            f"passes={markov_result.passes}"
+        )
+
+        if not markov_result.passes:
+            logger.info(
+                f"⏭ MARKOV: {markov_result.reason} — skipping trade"
+            )
+            return
+
         # --- Phase 5: Kelly criterion position sizing ---
         # Kelly formula: f* = p_model - (1-p_model)/b
         #
@@ -1022,8 +1055,10 @@ class IntegratedBTCStrategy(Strategy):
         position_size = kelly_size
 
         logger.info(
-            f"Kelly sizing: entry_price={entry_price:.4f}, p_model={kelly_p_model:.4f}, "
-            f"b={kelly_odds:.4f}, size=${float(position_size):.2f}, reason={kelly_reason}"
+            f"Kelly: entry={entry_price:.4f}, p_model={kelly_p_model:.4f}, "
+            f"b={kelly_odds:.4f}, markov_state={markov_result.current_state}, "
+            f"p_stay={markov_result.p_stay:.4f}, "
+            f"size=${float(position_size):.2f}, reason={kelly_reason}"
         )
 
         # Risk engine: only check position-count / exposure limits (no sizing math)
