@@ -22,7 +22,10 @@ journal_path: "logs/trade_journal"
 # Telegram (secrets go in .env, not here)
 # telegram_bot_token and telegram_chat_id are read from .env
 telegram_enabled: true
-telegram_trade_alerts: false
+telegram_trade_alerts: true
+telegram_skip_alerts: false
+telegram_bot_lifecycle_alerts: true
+telegram_error_alerts: true
 telegram_daily_summary: true
 
 # Nightly review

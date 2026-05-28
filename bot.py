@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 import math
 from decimal import Decimal
 import time
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 import random
@@ -69,6 +70,7 @@ from execution.risk_engine import get_risk_engine
 from execution.risk_engine import calculate_kelly_size, odds_from_price
 from core.strategy_brain.signal_processors.markov_processor import get_markov_filter
 from journal.trade_journal import get_journal
+from notifications.telegram_notifier import send_telegram_message, is_configured as tg_is_configured
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
@@ -87,6 +89,55 @@ else:
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
 QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
 MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
+
+
+class HealthWatchdog:
+    """
+    Watchdog that monitors journal activity and restarts bot if stale.
+    
+    If no journal writes for STALE_MINUTES, sends Telegram error alert
+    and exits cleanly so 15m_bot_runner.py can restart.
+    """
+    STALE_MINUTES = 30
+
+    def __init__(self, journal_path: str):
+        self.journal_path = Path(journal_path)
+        self._last_write_time = time.time()
+        self._thread = None
+        self._stop = threading.Event()
+
+    def touch(self):
+        """Call after each journal write to reset the timer."""
+        self._last_write_time = time.time()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="watchdog")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._stop.wait(60)  # check every 60 seconds
+            if self._stop.is_set():
+                break
+            elapsed = time.time() - self._last_write_time
+            if elapsed > self.STALE_MINUTES * 60:
+                logger.error(
+                    f"HEALTH WATCHDOG: No journal activity for {elapsed/60:.0f} min "
+                    f"(threshold: {self.STALE_MINUTES} min). Restarting."
+                )
+                try:
+                    from notifications.telegram_notifier import send_telegram_message
+                    send_telegram_message(
+                        f"🔴 DRY-RUN degraded — no journal writes for "
+                        f"{elapsed/60:.0f} min. Restarting bot."
+                    )
+                except Exception:
+                    pass
+                # Exit cleanly so runner restarts
+                os._exit(0)
 
 
 @dataclass
@@ -153,7 +204,7 @@ class IntegratedBTCStrategy(Strategy):
         # Nautilus
         self.instrument_id = None
         self.redis_client = redis_client
-        self.current_simulation_mode = False
+        self.current_simulation_mode = self.strategy_config.get("dry_run", True)
 
         # Store ALL BTC instruments
         self.all_btc_instruments: List[Dict] = []
@@ -222,6 +273,11 @@ class IntegratedBTCStrategy(Strategy):
         # Phase 4e: Trade Journal
         self.journal = get_journal()
 
+        # Phase 4f: Health Watchdog
+        journal_path = self.strategy_config.get("journal_path", "logs/trade_journal")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.watchdog = HealthWatchdog(f"{journal_path}_{today}.jsonl")
+
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
 
@@ -271,6 +327,33 @@ class IntegratedBTCStrategy(Strategy):
         now_ts = datetime.now(timezone.utc).timestamp()
         next_boundary = (math.floor(now_ts / MARKET_INTERVAL_SECONDS) + 1) * MARKET_INTERVAL_SECONDS
         return next_boundary - now_ts
+
+    def _journal_record(self, method_name: str, **kwargs):
+        """Call journal method and touch watchdog."""
+        getattr(self.journal, method_name)(**kwargs)
+
+    def _send_alert(self, alert_type: str, text: str) -> bool:
+        """
+        Send Telegram alert if enabled in strategy config.
+        Returns True if sent (or dry-run), False if skipped/disabled.
+        """
+        if not tg_is_configured():
+            return False
+        config = self.strategy_config
+        if not config.get("telegram_enabled", False):
+            return False
+        # Check per-type enable flags
+        if alert_type == "lifecycle" and not config.get("telegram_bot_lifecycle_alerts", True):
+            return False
+        if alert_type == "trade" and not config.get("telegram_trade_alerts", True):
+            return False
+        if alert_type == "skip" and not config.get("telegram_skip_alerts", False):
+            return False
+        if alert_type == "error" and not config.get("telegram_error_alerts", True):
+            return False
+        # Label as DRY-RUN
+        prefix = "[DRY-RUN] " if self.current_simulation_mode else ""
+        return send_telegram_message(f"{prefix}{text}")
 
     def _is_quote_valid(self, bid, ask) -> bool:
         """Return True only when BOTH bid and ask are present and make sense."""
@@ -326,6 +409,8 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         logger.info("INTEGRATED BTC STRATEGY STARTED - FIXED VERSION")
         logger.info("=" * 80)
+        self._send_alert("lifecycle", "🚀 Bot started (simulation mode)")
+        self.watchdog.start()
 
         # =========================================================================
         # FIX 2: Load ALL BTC instruments at startup
@@ -945,6 +1030,7 @@ class IntegratedBTCStrategy(Strategy):
                 p_stay=markov_result.p_stay,
                 min_prob=markov_result.min_prob,
             )
+            self.watchdog.touch()
             return
 
         # --- Phase 5: Kelly criterion position sizing ---
@@ -1009,6 +1095,7 @@ class IntegratedBTCStrategy(Strategy):
                 markov_state=markov_result.current_state,
                 p_stay=markov_result.p_stay,
             )
+            self.watchdog.touch()
             return
 
         # --- Phase 5b: Calculate Kelly size ---
@@ -1053,6 +1140,7 @@ class IntegratedBTCStrategy(Strategy):
                     markov_state=markov_result.current_state,
                     p_stay=markov_result.p_stay,
                 )
+                self.watchdog.touch()
             else:
                 # Live: skip trade entirely
                 kelly_reason = "missing_model_probability_for_kelly"
@@ -1090,6 +1178,7 @@ class IntegratedBTCStrategy(Strategy):
                 markov_state=markov_result.current_state,
                 p_stay=markov_result.p_stay,
             )
+            self.watchdog.touch()
             return
 
         position_size = kelly_size
@@ -1109,6 +1198,7 @@ class IntegratedBTCStrategy(Strategy):
         )
         if not is_valid:
             logger.warning(f"Risk engine blocked trade: {error}")
+            self._send_alert("trade", f"🚫 Order rejected: risk engine — {error}")
             self.journal.log_order_rejected(
                 dry_run=is_simulation,
                 decision_reason=f"risk_engine_blocked: {error}",
@@ -1118,9 +1208,11 @@ class IntegratedBTCStrategy(Strategy):
                 error_type="risk_engine_rejection",
                 error_message_sanitized=str(error)[:200],
             )
+            self.watchdog.touch()
             return
 
         logger.info(f"Position size: ${float(position_size):.2f} | Direction: {direction.upper()}")
+        self._send_alert("trade", f"✅ Trade authorized: {direction.upper()} ${float(position_size):.2f} @ {entry_price:.4f}")
 
         # --- Journal: Full decision record ---
         kelly_raw = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else None
@@ -1141,6 +1233,7 @@ class IntegratedBTCStrategy(Strategy):
             min_prob=markov_result.min_prob,
             decision_reason=f"trade_authorized: {kelly_reason}",
         )
+        self.watchdog.touch()
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -1161,6 +1254,7 @@ class IntegratedBTCStrategy(Strategy):
                     entry_price=entry_price,
                     size=float(position_size),
                 )
+                self.watchdog.touch()
                 self.last_trade_time = -1  # Allow retry next tick
                 return
             if direction == "short" and last_bid <= MIN_LIQUIDITY:
@@ -1174,6 +1268,7 @@ class IntegratedBTCStrategy(Strategy):
                     entry_price=entry_price,
                     size=float(position_size),
                 )
+                self.watchdog.touch()
                 self.last_trade_time = -1  # Allow retry next tick
                 return
 
@@ -1243,6 +1338,7 @@ class IntegratedBTCStrategy(Strategy):
             simulated_pnl=float(pnl),
             mark_price=float(exit_price),
         )
+        self.watchdog.touch()
 
         logger.info("=" * 80)
         logger.info("[SIMULATION] PAPER TRADE RECORDED")
@@ -1251,7 +1347,8 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"  Entry Price: ${float(current_price):,.4f}")
         logger.info(f"  Simulated Exit: ${float(exit_price):,.4f}")
         logger.info(f"  Simulated P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
-        logger.info(f"  Outcome: {outcome}")
+        logger.info("  Outcome: {outcome}")
+        self._send_alert("trade", f"📊 Simulated order: {direction.upper()} ${float(position_size):.2f} @ {float(current_price):.4f} → {outcome} (${float(pnl):+.2f})")
         logger.info(f"  Total Paper Trades: {len(self.paper_trades)}")
         logger.info("=" * 80)
 
@@ -1506,6 +1603,8 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
+        self._send_alert("lifecycle", f"⏹ Bot stopped (paper trades: {len(self.paper_trades)})")
+        self.watchdog.stop()
         if self.grafana_exporter:
             import asyncio
             try:
