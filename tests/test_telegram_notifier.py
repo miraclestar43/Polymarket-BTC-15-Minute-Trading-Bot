@@ -69,8 +69,8 @@ def test_mask_address():
     assert result.startswith("0xabc")
     assert result.endswith("cdef")
     assert "…" in result
-    # Short address → redacted
-    assert _mask_address("0x123") == "[REDACTED]"
+    # Short address → masked
+    assert _mask_address("0x123") == "****"
     print("  ✓ Address masking works")
 
 

@@ -39,3 +39,8 @@ min_prob_daily_step: 0.02
 kelly_fraction_cap_min: 0.01
 kelly_fraction_cap_max: 0.10
 kelly_fraction_cap_daily_step: 0.01
+
+# Watchdog
+watchdog_enabled: true
+watchdog_stale_minutes: 45
+watchdog_heartbeat_path: "logs/bot_heartbeat.json"

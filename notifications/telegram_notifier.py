@@ -38,8 +38,10 @@ _SENSITIVE_KEYWORDS = (
 
 def _mask_address(value: str) -> str:
     """Mask an Ethereum-like address: show first 6 and last 4 characters."""
-    if not isinstance(value, str) or len(value) < 14:
-        return "[REDACTED]"
+    if not isinstance(value, str) or len(value) < 6:
+        return "****"
+    if len(value) < 14:
+        return f"{value[:3]}…{value[-2:]}"
     return f"{value[:6]}…{value[-4:]}"
 
 
@@ -155,15 +157,22 @@ def send_telegram_message(text: str, dry_run: bool = False) -> bool:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            status = resp.getcode()
-            if status == 200:
-                _log.info(f"Telegram: message sent to {_mask_chat_id(config['chat_id'])}")
+            body = json.loads(resp.read().decode())
+            if body.get("ok"):
+                msg_id = body.get("result", {}).get("message_id", "?")
+                _log.info(f"Telegram: sent to {_mask_chat_id(config['chat_id'])} (msg_id={msg_id})")
                 return True
             else:
-                _log.error(f"Telegram: unexpected status {status}")
+                desc = body.get("description", "unknown error")
+                _log.error(f"Telegram API error: {desc}")
                 return False
     except urllib.error.HTTPError as e:
-        _log.error(f"Telegram HTTP error: {e.code} {e.reason}")
+        body = ""
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            pass
+        _log.error(f"Telegram HTTP error: {e.code} — {body}")
         return False
     except Exception as e:
         _log.error(f"Telegram send failed: {e}")

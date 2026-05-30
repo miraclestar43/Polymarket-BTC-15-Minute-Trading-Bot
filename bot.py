@@ -7,6 +7,7 @@ import math
 from decimal import Decimal
 import time
 import threading
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 import random
@@ -93,24 +94,36 @@ MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
 
 class HealthWatchdog:
     """
-    Watchdog that monitors journal activity and restarts bot if stale.
-    
-    If no journal writes for STALE_MINUTES, sends Telegram error alert
-    and exits cleanly so 15m_bot_runner.py can restart.
-    """
-    STALE_MINUTES = 30
+    Heartbeat-based watchdog that monitors bot liveness.
 
-    def __init__(self, journal_path: str):
-        self.journal_path = Path(journal_path)
-        self._last_write_time = time.time()
+    Writes heartbeat updates on meaningful progress (quote ticks,
+    timer cycles, journal writes, startup). If heartbeat is stale,
+    sends Telegram error alert and exits cleanly so runner restarts.
+    """
+    DEFAULT_STALE_MINUTES = 45
+
+    def __init__(self, heartbeat_path: str, stale_minutes: int = DEFAULT_STALE_MINUTES):
+        self.heartbeat_path = Path(heartbeat_path)
+        self.stale_minutes = stale_minutes
+        self._last_heartbeat = time.time()
         self._thread = None
         self._stop = threading.Event()
 
-    def touch(self):
-        """Call after each journal write to reset the timer."""
-        self._last_write_time = time.time()
+    def heartbeat(self, event: str = "tick"):
+        """Update heartbeat timestamp and write to file."""
+        self._last_heartbeat = time.time()
+        try:
+            self.heartbeat_path.write_text(json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": event,
+                "uptime_s": int(time.time() - self._start_time) if hasattr(self, '_start_time') else 0,
+            }))
+        except Exception:
+            pass
 
     def start(self):
+        self._start_time = time.time()
+        self.heartbeat("start")
         self._thread = threading.Thread(target=self._run, daemon=True, name="watchdog")
         self._thread.start()
 
@@ -122,21 +135,20 @@ class HealthWatchdog:
             self._stop.wait(60)  # check every 60 seconds
             if self._stop.is_set():
                 break
-            elapsed = time.time() - self._last_write_time
-            if elapsed > self.STALE_MINUTES * 60:
+            elapsed = time.time() - self._last_heartbeat
+            if elapsed > self.stale_minutes * 60:
                 logger.error(
-                    f"HEALTH WATCHDOG: No journal activity for {elapsed/60:.0f} min "
-                    f"(threshold: {self.STALE_MINUTES} min). Restarting."
+                    f"HEALTH WATCHDOG: Heartbeat stale for {elapsed/60:.0f} min "
+                    f"(threshold: {self.stale_minutes} min). Restarting."
                 )
                 try:
                     from notifications.telegram_notifier import send_telegram_message
                     send_telegram_message(
-                        f"🔴 DRY-RUN degraded — no journal writes for "
+                        f"🔴 DRY-RUN degraded — heartbeat stale for "
                         f"{elapsed/60:.0f} min. Restarting bot."
                     )
                 except Exception:
                     pass
-                # Exit cleanly so runner restarts
                 os._exit(0)
 
 
@@ -274,9 +286,9 @@ class IntegratedBTCStrategy(Strategy):
         self.journal = get_journal()
 
         # Phase 4f: Health Watchdog
-        journal_path = self.strategy_config.get("journal_path", "logs/trade_journal")
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        self.watchdog = HealthWatchdog(f"{journal_path}_{today}.jsonl")
+        heartbeat_path = self.strategy_config.get("watchdog_heartbeat_path", "logs/bot_heartbeat.json")
+        stale_minutes = self.strategy_config.get("watchdog_stale_minutes", 45)
+        self.watchdog = HealthWatchdog(heartbeat_path, stale_minutes=stale_minutes)
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
@@ -683,6 +695,7 @@ class IntegratedBTCStrategy(Strategy):
         Also handles the case where we're waiting for a future market to open.
         """
         while True:
+            self.watchdog.heartbeat("timer_loop")
             # --- auto-restart check ---
             uptime_minutes = (datetime.now(timezone.utc) - self.bot_start_time).total_seconds() / 60
             if uptime_minutes >= self.restart_after_minutes:
@@ -724,6 +737,7 @@ class IntegratedBTCStrategy(Strategy):
     def on_quote_tick(self, tick: QuoteTick):
         """Handle quote tick - TRADE when market opens and at each 15-min boundary"""
         try:
+            self.watchdog.heartbeat("quote_tick")
             # Only process ticks from current instrument
             if self.instrument_id is None or tick.instrument_id != self.instrument_id:
                 return
@@ -1030,7 +1044,7 @@ class IntegratedBTCStrategy(Strategy):
                 p_stay=markov_result.p_stay,
                 min_prob=markov_result.min_prob,
             )
-            self.watchdog.touch()
+            self.watchdog.heartbeat("journal")
             return
 
         # --- Phase 5: Kelly criterion position sizing ---
@@ -1095,7 +1109,7 @@ class IntegratedBTCStrategy(Strategy):
                 markov_state=markov_result.current_state,
                 p_stay=markov_result.p_stay,
             )
-            self.watchdog.touch()
+            self.watchdog.heartbeat("journal")
             return
 
         # --- Phase 5b: Calculate Kelly size ---
@@ -1140,7 +1154,7 @@ class IntegratedBTCStrategy(Strategy):
                     markov_state=markov_result.current_state,
                     p_stay=markov_result.p_stay,
                 )
-                self.watchdog.touch()
+                self.watchdog.heartbeat("journal")
             else:
                 # Live: skip trade entirely
                 kelly_reason = "missing_model_probability_for_kelly"
@@ -1178,7 +1192,7 @@ class IntegratedBTCStrategy(Strategy):
                 markov_state=markov_result.current_state,
                 p_stay=markov_result.p_stay,
             )
-            self.watchdog.touch()
+            self.watchdog.heartbeat("journal")
             return
 
         position_size = kelly_size
@@ -1208,7 +1222,7 @@ class IntegratedBTCStrategy(Strategy):
                 error_type="risk_engine_rejection",
                 error_message_sanitized=str(error)[:200],
             )
-            self.watchdog.touch()
+            self.watchdog.heartbeat("journal")
             return
 
         logger.info(f"Position size: ${float(position_size):.2f} | Direction: {direction.upper()}")
@@ -1233,7 +1247,7 @@ class IntegratedBTCStrategy(Strategy):
             min_prob=markov_result.min_prob,
             decision_reason=f"trade_authorized: {kelly_reason}",
         )
-        self.watchdog.touch()
+        self.watchdog.heartbeat("journal")
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -1254,7 +1268,7 @@ class IntegratedBTCStrategy(Strategy):
                     entry_price=entry_price,
                     size=float(position_size),
                 )
-                self.watchdog.touch()
+                self.watchdog.heartbeat("journal")
                 self.last_trade_time = -1  # Allow retry next tick
                 return
             if direction == "short" and last_bid <= MIN_LIQUIDITY:
@@ -1268,17 +1282,30 @@ class IntegratedBTCStrategy(Strategy):
                     entry_price=entry_price,
                     size=float(position_size),
                 )
-                self.watchdog.touch()
+                self.watchdog.heartbeat("journal")
                 self.last_trade_time = -1  # Allow retry next tick
                 return
 
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
-            await self._record_paper_trade(fused, position_size, current_price, direction)
+            trade_meta = {
+                "p_model": kelly_p_model,
+                "p_model_source": "fused_confidence_proxy",
+                "odds_b": kelly_odds,
+                "raw_kelly_fraction": round(kelly_raw, 6) if kelly_raw is not None else None,
+                "capped_kelly_fraction": round(kelly_capped, 6) if kelly_capped is not None else None,
+                "kelly_size": float(position_size),
+                "markov_state": markov_result.current_state,
+                "p_stay": markov_result.p_stay,
+                "min_prob": markov_result.min_prob,
+                "entry_price": entry_price,
+                "simulation": True,
+            }
+            await self._record_paper_trade(fused, position_size, current_price, direction, trade_meta)
         else:
             await self._place_real_order(fused, position_size, current_price, direction)
             
-    async def _record_paper_trade(self, signal, position_size, current_price, direction):
+    async def _record_paper_trade(self, signal, position_size, current_price, direction, trade_meta=None):
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
 
@@ -1329,6 +1356,7 @@ class IntegratedBTCStrategy(Strategy):
             self.grafana_exporter.record_trade_duration(exit_delta.total_seconds())
 
         # Log simulated order to journal
+        meta = trade_meta or {}
         self.journal.log_simulated_order(
             dry_run=True,
             side="long" if direction == "long" else "short",
@@ -1337,8 +1365,19 @@ class IntegratedBTCStrategy(Strategy):
             order_id=f"paper_{int(datetime.now().timestamp())}",
             simulated_pnl=float(pnl),
             mark_price=float(exit_price),
+            p_model=meta.get("p_model"),
+            p_model_source=meta.get("p_model_source"),
+            p_stay=meta.get("p_stay"),
+            markov_state=meta.get("markov_state"),
+            min_prob=meta.get("min_prob"),
+            odds_b=meta.get("odds_b"),
+            raw_kelly_fraction=meta.get("raw_kelly_fraction"),
+            capped_kelly_fraction=meta.get("capped_kelly_fraction"),
+            kelly_size=meta.get("kelly_size"),
+            decision_reason=meta.get("decision_reason"),
+            simulation=meta.get("simulation", True),
         )
-        self.watchdog.touch()
+        self.watchdog.heartbeat("journal")
 
         logger.info("=" * 80)
         logger.info("[SIMULATION] PAPER TRADE RECORDED")

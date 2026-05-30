@@ -510,6 +510,8 @@ def main():
         telegram_config = current_config.get("telegram_daily_summary", True)
         if telegram_config and is_configured():
             summary_text = format_telegram_summary(date_str, analysis, recommendations, applied)
+            # --dry-run only affects strategy changes, not Telegram
+            # --no-telegram controls whether Telegram is sent
             success = send_daily_summary(
                 {
                     "date": date_str,
@@ -524,7 +526,7 @@ def main():
                     "avg_p_model": analysis["avg_p_model"],
                     "avg_kelly_size": analysis["avg_kelly_size"],
                 },
-                dry_run=args.dry_run,
+                dry_run=False,  # Telegram always sends unless --no-telegram
             )
             if success:
                 print("✓ Telegram summary sent")
