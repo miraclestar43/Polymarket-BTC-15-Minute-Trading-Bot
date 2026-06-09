@@ -71,6 +71,9 @@ from execution.risk_engine import get_risk_engine
 from execution.risk_engine import calculate_kelly_size, odds_from_price
 from core.strategy_brain.signal_processors.markov_processor import get_markov_filter
 from journal.trade_journal import get_journal
+from core.strategy_brain.shadow_evaluator import evaluate_shadow
+from core.strategy_brain.btc_regime_tracker import get_btc_regime
+from core.strategy_brain.market_resolver import get_market_resolver
 from notifications.telegram_notifier import send_telegram_message, is_configured as tg_is_configured
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
@@ -977,6 +980,50 @@ class IntegratedBTCStrategy(Strategy):
 
         logger.info(f"Current price: ${float(current_price):,.4f}")
 
+        # --- BTC regime diagnostics (does not affect trading) ---
+        try:
+            btc_regime_data = get_btc_regime()
+        except Exception:
+            btc_regime_data = {
+                "btc_price": None, "btc_return_15m": None, "btc_return_1h": None,
+                "btc_return_4h": None, "btc_regime": "unavailable",
+                "regime_source": "error", "regime_timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # --- Market resolution diagnostics (does not affect trading) ---
+        try:
+            resolver = get_market_resolver()
+            # Get market identifiers from instrument.info
+            market_slug = None
+            market_question = None
+            market_end_time = None
+            if self.instrument_id:
+                instrument = self.cache.instrument(self.instrument_id)
+                if instrument and hasattr(instrument, 'info') and instrument.info:
+                    market_slug = instrument.info.get('market_slug')
+                    market_question = instrument.info.get('question')
+                    market_end_time = instrument.info.get('endDate')
+
+            market_resolution = resolver.resolve(
+                market_id=str(self.instrument_id) if self.instrument_id else None,
+                slug=market_slug,
+            )
+            # Add market identifiers to resolution result
+            market_resolution["market_slug"] = market_slug
+            market_resolution["market_question"] = market_question
+            market_resolution["market_end_time"] = market_end_time
+        except Exception:
+            market_resolution = {
+                "resolution_status": "error",
+                "resolved_outcome": None,
+                "resolution_time": None,
+                "resolution_source": "error",
+                "resolution_error": "resolver_exception",
+                "market_slug": None,
+                "market_question": None,
+                "market_end_time": None,
+            }
+
         # --- Phase 4a: Build real metadata for processors ---
         metadata = await self._fetch_market_context(current_price)
 
@@ -1045,6 +1092,46 @@ class IntegratedBTCStrategy(Strategy):
                 min_prob=markov_result.min_prob,
             )
             self.watchdog.heartbeat("journal")
+            # Shadow evaluation for Markov skip
+            try:
+                evaluate_shadow(
+                    actual_event_type="skipped_trade",
+                    actual_decision_reason=f"markov_persistence_below_threshold: {markov_result.reason}",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                    direction="long" if "BULLISH" in direction_str else "short" if "BEARISH" in direction_str else "unknown",
+                    entry_price=float(current_price),
+                    p_model=fused.confidence if fused and fused.confidence else 0.0,
+                    p_model_source="fused_confidence_proxy",
+                    odds_b=0.0,
+                    kelly_raw=0.0,
+                    kelly_capped=0.0,
+                    kelly_size=0.0,
+                    markov_state=markov_result.current_state,
+                    p_stay=markov_result.p_stay,
+                    min_prob_actual=markov_result.min_prob,
+                    markov_window_actual=self.strategy_config.get("markov_window", 20),
+                    markov_passed=False,
+                    kelly_passed=False,
+                    liquidity_passed=None,
+                    btc_price=btc_regime_data.get("btc_price"),
+                    btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                    btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                    btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                    btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                    regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                    regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                )
+            except Exception:
+                pass
             return
 
         # --- Phase 5: Kelly criterion position sizing ---
@@ -1110,6 +1197,46 @@ class IntegratedBTCStrategy(Strategy):
                 p_stay=markov_result.p_stay,
             )
             self.watchdog.heartbeat("journal")
+            # Shadow evaluation for neutral signal skip
+            try:
+                evaluate_shadow(
+                    actual_event_type="skipped_trade",
+                    actual_decision_reason="trend_neutral_price_near_0.50",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                    direction="unknown",
+                    entry_price=price_float,
+                    p_model=fused.confidence if fused and fused.confidence else 0.0,
+                    p_model_source="fused_confidence_proxy",
+                    odds_b=0.0,
+                    kelly_raw=0.0,
+                    kelly_capped=0.0,
+                    kelly_size=0.0,
+                    markov_state=markov_result.current_state,
+                    p_stay=markov_result.p_stay,
+                    min_prob_actual=markov_result.min_prob,
+                    markov_window_actual=self.strategy_config.get("markov_window", 20),
+                    markov_passed=markov_result.passes,
+                    kelly_passed=False,
+                    liquidity_passed=None,
+                    btc_price=btc_regime_data.get("btc_price"),
+                    btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                    btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                    btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                    btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                    regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                    regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                )
+            except Exception:
+                pass
             return
 
         # --- Phase 5b: Calculate Kelly size ---
@@ -1155,6 +1282,46 @@ class IntegratedBTCStrategy(Strategy):
                     p_stay=markov_result.p_stay,
                 )
                 self.watchdog.heartbeat("journal")
+                # Shadow evaluation for missing p_model
+                try:
+                    evaluate_shadow(
+                        actual_event_type="skipped_trade",
+                        actual_decision_reason=kelly_reason,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                        direction=direction,
+                        entry_price=entry_price,
+                        p_model=kelly_p_model or 0.0,
+                        p_model_source="fused_confidence_proxy",
+                        odds_b=kelly_odds or 0.0,
+                        kelly_raw=0.0,
+                        kelly_capped=0.0,
+                        kelly_size=0.0,
+                        markov_state=markov_result.current_state,
+                        p_stay=markov_result.p_stay,
+                        min_prob_actual=markov_result.min_prob,
+                        markov_window_actual=self.strategy_config.get("markov_window", 20),
+                        markov_passed=markov_result.passes,
+                        kelly_passed=False,
+                        liquidity_passed=None,
+                        btc_price=btc_regime_data.get("btc_price"),
+                        btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                        btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                        btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                        btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                        regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                        regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                    )
+                except Exception:
+                    pass
             else:
                 # Live: skip trade entirely
                 kelly_reason = "missing_model_probability_for_kelly"
@@ -1193,6 +1360,48 @@ class IntegratedBTCStrategy(Strategy):
                 p_stay=markov_result.p_stay,
             )
             self.watchdog.heartbeat("journal")
+            # Shadow evaluation for Kelly no-edge
+            kelly_raw_val = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else 0.0
+            kelly_capped_val = min(kelly_raw_val, self.strategy_config.get("kelly_fraction_cap", 0.05)) if kelly_raw_val > 0 else 0.0
+            try:
+                evaluate_shadow(
+                    actual_event_type="skipped_trade",
+                    actual_decision_reason=f"kelly_no_edge: {kelly_reason}",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                    direction=direction,
+                    entry_price=entry_price,
+                    p_model=kelly_p_model or 0.0,
+                    p_model_source="fused_confidence_proxy",
+                    odds_b=kelly_odds or 0.0,
+                    kelly_raw=kelly_raw_val,
+                    kelly_capped=kelly_capped_val,
+                    kelly_size=0.0,
+                    markov_state=markov_result.current_state,
+                    p_stay=markov_result.p_stay,
+                    min_prob_actual=markov_result.min_prob,
+                    markov_window_actual=self.strategy_config.get("markov_window", 20),
+                    markov_passed=markov_result.passes,
+                    kelly_passed=False,
+                    liquidity_passed=None,
+                    btc_price=btc_regime_data.get("btc_price"),
+                    btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                    btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                    btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                    btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                    regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                    regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                )
+            except Exception:
+                pass
             return
 
         position_size = kelly_size
@@ -1223,6 +1432,48 @@ class IntegratedBTCStrategy(Strategy):
                 error_message_sanitized=str(error)[:200],
             )
             self.watchdog.heartbeat("journal")
+            # Shadow evaluation for risk engine blocked
+            _kr = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else 0.0
+            _kc = min(_kr, self.strategy_config.get("kelly_fraction_cap", 0.05)) if _kr > 0 else 0.0
+            try:
+                evaluate_shadow(
+                    actual_event_type="order_rejected",
+                    actual_decision_reason=f"risk_engine_blocked: {error}",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                    direction=direction,
+                    entry_price=entry_price,
+                    p_model=kelly_p_model or 0.0,
+                    p_model_source="fused_confidence_proxy",
+                    odds_b=kelly_odds or 0.0,
+                    kelly_raw=_kr,
+                    kelly_capped=_kc,
+                    kelly_size=float(position_size),
+                    markov_state=markov_result.current_state,
+                    p_stay=markov_result.p_stay,
+                    min_prob_actual=markov_result.min_prob,
+                    markov_window_actual=self.strategy_config.get("markov_window", 20),
+                    markov_passed=markov_result.passes,
+                    kelly_passed=True,
+                    liquidity_passed=None,
+                    btc_price=btc_regime_data.get("btc_price"),
+                    btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                    btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                    btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                    btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                    regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                    regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                )
+            except Exception:
+                pass
             return
 
         logger.info(f"Position size: ${float(position_size):.2f} | Direction: {direction.upper()}")
@@ -1249,6 +1500,49 @@ class IntegratedBTCStrategy(Strategy):
         )
         self.watchdog.heartbeat("journal")
 
+        # --- Shadow evaluation (does not affect actual execution) ---
+        try:
+            evaluate_shadow(
+                actual_event_type="decision",
+                actual_decision_reason=f"trade_authorized: {kelly_reason}",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                direction=direction,
+                entry_price=float(entry_price),
+                p_model=kelly_p_model or 0.0,
+                p_model_source="fused_confidence_proxy",
+                odds_b=kelly_odds or 0.0,
+                kelly_raw=kelly_raw or 0.0,
+                kelly_capped=kelly_capped or 0.0,
+                kelly_size=float(position_size),
+                markov_state=markov_result.current_state,
+                p_stay=markov_result.p_stay,
+                min_prob_actual=markov_result.min_prob,
+                markov_window_actual=self.strategy_config.get("markov_window", 20),
+                markov_passed=markov_result.passes,
+                kelly_passed=True,
+                liquidity_passed=True,
+                fee_estimate=None,
+                fee_source=None,
+                btc_price=btc_regime_data.get("btc_price"),
+                btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+            )
+        except Exception:
+            pass
+
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
         # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
@@ -1269,6 +1563,48 @@ class IntegratedBTCStrategy(Strategy):
                     size=float(position_size),
                 )
                 self.watchdog.heartbeat("journal")
+                # Shadow evaluation for liquidity guard
+                _kr = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else 0.0
+                _kc = min(_kr, self.strategy_config.get("kelly_fraction_cap", 0.05)) if _kr > 0 else 0.0
+                try:
+                    evaluate_shadow(
+                        actual_event_type="skipped_trade",
+                        actual_decision_reason=f"no_liquidity_ask={float(last_ask):.4f}",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                        direction="long",
+                        entry_price=entry_price,
+                        p_model=kelly_p_model or 0.0,
+                        p_model_source="fused_confidence_proxy",
+                        odds_b=kelly_odds or 0.0,
+                        kelly_raw=_kr,
+                        kelly_capped=_kc,
+                        kelly_size=float(position_size),
+                        markov_state=markov_result.current_state,
+                        p_stay=markov_result.p_stay,
+                        min_prob_actual=markov_result.min_prob,
+                        markov_window_actual=self.strategy_config.get("markov_window", 20),
+                        markov_passed=markov_result.passes,
+                        kelly_passed=True,
+                        liquidity_passed=False,
+                        btc_price=btc_regime_data.get("btc_price"),
+                        btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                        btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                        btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                        btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                        regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                        regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                    )
+                except Exception:
+                    pass
                 self.last_trade_time = -1  # Allow retry next tick
                 return
             if direction == "short" and last_bid <= MIN_LIQUIDITY:
@@ -1283,6 +1619,48 @@ class IntegratedBTCStrategy(Strategy):
                     size=float(position_size),
                 )
                 self.watchdog.heartbeat("journal")
+                # Shadow evaluation for liquidity guard (short)
+                _kr = kelly_p_model - (1.0 - kelly_p_model) / kelly_odds if kelly_odds and kelly_p_model else 0.0
+                _kc = min(_kr, self.strategy_config.get("kelly_fraction_cap", 0.05)) if _kr > 0 else 0.0
+                try:
+                    evaluate_shadow(
+                        actual_event_type="skipped_trade",
+                        actual_decision_reason=f"no_liquidity_bid={float(last_bid):.4f}",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        market_id=str(self.instrument_id) if self.instrument_id else "unknown",
+                        direction="short",
+                        entry_price=entry_price,
+                        p_model=kelly_p_model or 0.0,
+                        p_model_source="fused_confidence_proxy",
+                        odds_b=kelly_odds or 0.0,
+                        kelly_raw=_kr,
+                        kelly_capped=_kc,
+                        kelly_size=float(position_size),
+                        markov_state=markov_result.current_state,
+                        p_stay=markov_result.p_stay,
+                        min_prob_actual=markov_result.min_prob,
+                        markov_window_actual=self.strategy_config.get("markov_window", 20),
+                        markov_passed=markov_result.passes,
+                        kelly_passed=True,
+                        liquidity_passed=False,
+                        btc_price=btc_regime_data.get("btc_price"),
+                        btc_return_15m=btc_regime_data.get("btc_return_15m"),
+                        btc_return_1h=btc_regime_data.get("btc_return_1h"),
+                        btc_return_4h=btc_regime_data.get("btc_return_4h"),
+                        btc_regime=btc_regime_data.get("btc_regime", "unavailable"),
+                        regime_source=btc_regime_data.get("regime_source", "not_implemented"),
+                        regime_timestamp=btc_regime_data.get("regime_timestamp"),
+                    resolution_status=market_resolution.get("resolution_status", "pending"),
+                    resolved_outcome=market_resolution.get("resolved_outcome"),
+                    resolution_time=market_resolution.get("resolution_time"),
+                    resolution_source=market_resolution.get("resolution_source"),
+                    resolution_error=market_resolution.get("resolution_error"),
+                    market_slug=market_resolution.get("market_slug"),
+                    market_question=market_resolution.get("market_question"),
+                    market_end_time=market_resolution.get("market_end_time"),
+                    )
+                except Exception:
+                    pass
                 self.last_trade_time = -1  # Allow retry next tick
                 return
 
@@ -1375,7 +1753,6 @@ class IntegratedBTCStrategy(Strategy):
             capped_kelly_fraction=meta.get("capped_kelly_fraction"),
             kelly_size=meta.get("kelly_size"),
             decision_reason=meta.get("decision_reason"),
-            simulation=meta.get("simulation", True),
         )
         self.watchdog.heartbeat("journal")
 

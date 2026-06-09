@@ -188,7 +188,7 @@ def run_bot():
     try:
         while True:
             restart_count += 1
-            current_child_pid[None] = None
+            current_child_pid[0] = None
 
             print("=" * 80)
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
