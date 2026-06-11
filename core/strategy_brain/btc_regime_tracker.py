@@ -169,9 +169,9 @@ class BTCRegimeTracker:
             self._cache_time = now
             return result
 
-        # Add to rolling history and persist
-        self._price_history.append((now, current_price))
+        # Persist first, then add to rolling history
         self._persist_price(now, current_price, result["regime_source"])
+        self._price_history.append((now, current_price))
         self._trim_history()
 
         result["btc_price"] = current_price

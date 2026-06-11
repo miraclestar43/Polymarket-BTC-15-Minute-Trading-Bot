@@ -124,7 +124,20 @@ class RunnerWatchdog:
             print(f"[WATCHDOG] Cooldown active, skipping restart")
             return
 
-        print(f"[WATCHDOG] Restarting child (reason: {reason})")
+        # Gather diagnostic info before restart
+        heartbeat_age = self._get_file_age(HEARTBEAT_FILE)
+        journal_age = self._get_newest_file_age(JOURNAL_DIR, "trade_journal_*.jsonl")
+        shadow_age = self._get_newest_file_age(SHADOW_DIR, "shadow_decisions_*.jsonl")
+
+        print(f"[WATCHDOG] === RESTART DIAGNOSTICS ===")
+        print(f"[WATCHDOG] Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[WATCHDOG] Old child PID: {child_pid}")
+        print(f"[WATCHDOG] Reason: {reason}")
+        print(f"[WATCHDOG] Heartbeat age: {heartbeat_age:.0f}s" if heartbeat_age else "[WATCHDOG] Heartbeat age: unknown")
+        print(f"[WATCHDOG] Journal age: {journal_age:.0f}s" if journal_age else "[WATCHDOG] Journal age: unknown")
+        print(f"[WATCHDOG] Shadow age: {shadow_age:.0f}s" if shadow_age else "[WATCHDOG] Shadow age: unknown")
+        print(f"[WATCHDOG] === END DIAGNOSTICS ===")
+
         self._last_restart_time = now
 
         # Try graceful termination first

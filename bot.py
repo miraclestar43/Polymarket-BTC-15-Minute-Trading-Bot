@@ -997,16 +997,19 @@ class IntegratedBTCStrategy(Strategy):
             market_slug = None
             market_question = None
             market_end_time = None
+            instrument_info = None
             if self.instrument_id:
                 instrument = self.cache.instrument(self.instrument_id)
                 if instrument and hasattr(instrument, 'info') and instrument.info:
                     market_slug = instrument.info.get('market_slug')
                     market_question = instrument.info.get('question')
                     market_end_time = instrument.info.get('endDate')
+                    instrument_info = instrument.info
 
             market_resolution = resolver.resolve(
                 market_id=str(self.instrument_id) if self.instrument_id else None,
                 slug=market_slug,
+                market_data=instrument_info,
             )
             # Add market identifiers to resolution result
             market_resolution["market_slug"] = market_slug

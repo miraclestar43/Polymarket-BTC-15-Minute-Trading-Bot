@@ -94,6 +94,7 @@ class MarketResolver:
         market_id: Optional[str] = None,
         condition_id: Optional[str] = None,
         slug: Optional[str] = None,
+        market_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Resolve a market outcome.
@@ -135,10 +136,12 @@ class MarketResolver:
         }
 
         try:
-            market_data = self._fetch_market(
-                condition_id=condition_id,
-                slug=slug,
-            )
+            # Use provided market_data if available, otherwise query Gamma API
+            if market_data is None:
+                market_data = self._fetch_market(
+                    condition_id=condition_id,
+                    slug=slug,
+                )
 
             if market_data is None:
                 result["resolution_status"] = "unavailable"
@@ -172,7 +175,20 @@ class MarketResolver:
                     result["resolution_status"] = "pending"
                     result["resolution_error"] = "closed_but_no_outcome"
             else:
-                result["resolution_status"] = "pending"
+                # Check for stale pending (market should have ended)
+                end_date = market_data.get("endDate") or market_data.get("endDateIso")
+                if end_date:
+                    try:
+                        from datetime import datetime as dt
+                        end_time = dt.fromisoformat(end_date.replace("Z", "+00:00"))
+                        age_minutes = (dt.now(end_time.tzinfo) - end_time).total_seconds() / 60
+                        if age_minutes > 60:
+                            result["resolution_status"] = "stale_pending"
+                            result["resolution_error"] = f"market_ended_{age_minutes:.0f}_minutes_ago"
+                    except Exception:
+                        pass
+                if result["resolution_status"] == "pending":
+                    pass  # Keep as pending
 
         except Exception as e:
             result["resolution_status"] = "error"
