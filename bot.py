@@ -72,7 +72,7 @@ from execution.risk_engine import calculate_kelly_size, odds_from_price
 from core.strategy_brain.signal_processors.markov_processor import get_markov_filter
 from journal.trade_journal import get_journal
 from core.strategy_brain.shadow_evaluator import evaluate_shadow
-from core.strategy_brain.btc_regime_tracker import get_btc_regime
+from core.strategy_brain.regime.aggregator import get_and_persist_regime
 from core.strategy_brain.market_resolver import get_market_resolver
 from notifications.telegram_notifier import send_telegram_message, is_configured as tg_is_configured
 from monitoring.performance_tracker import get_performance_tracker
@@ -982,7 +982,7 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- BTC regime diagnostics (does not affect trading) ---
         try:
-            btc_regime_data = get_btc_regime()
+            btc_regime_data = get_and_persist_regime()
         except Exception:
             btc_regime_data = {
                 "btc_price": None, "btc_return_15m": None, "btc_return_1h": None,

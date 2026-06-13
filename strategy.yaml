@@ -44,3 +44,19 @@ kelly_fraction_cap_daily_step: 0.01
 watchdog_enabled: true
 watchdog_stale_minutes: 45
 watchdog_heartbeat_path: "logs/bot_heartbeat.json"
+
+# Regime diagnostics (Phase 1) — DIAGNOSTICS ONLY, never a trading gate.
+# Macro daily candles are cached locally and refreshed only on age threshold;
+# they are never fetched inside the hot decision loop.
+regime_diagnostics:
+  enabled: true
+  # Refresh BTC daily candles at most this often (seconds). 12h default.
+  macro_max_age_seconds: 43200
+  # Persist a combined regime snapshot at most this often (seconds). 5m default.
+  snapshot_interval_seconds: 300
+  snapshot_path: "logs/btc_regime_history.jsonl"
+  daily_candles_cache_path: "logs/btc_daily_candles.json"
+  # Preferred candle sources (NO Binance — Pi had Binance access issues).
+  candle_sources: ["coingecko", "coinbase"]
+  # Phase 2 (NOT implemented): crypto breadth / TradingView BPI-style index.
+  breadth_enabled: false

@@ -136,6 +136,7 @@ class BTCRegimeTracker:
             "btc_return_1h": None,
             "btc_return_4h": None,
             "btc_regime": "unavailable",
+            "intraday_regime": "unavailable",
             "regime_source": "none",
             "regime_timestamp": datetime.now(timezone.utc).isoformat(),
             "regime_error": None,
@@ -224,6 +225,11 @@ class BTCRegimeTracker:
             result["btc_regime"] = "unavailable"
             if result["regime_error"] is None:
                 result["regime_error"] = "insufficient_history"
+
+        # Phase 1: `intraday_regime` is an explicit alias for the short-term
+        # (15m/1h/4h) regime, to distinguish it from the macro daily regime.
+        # This is the SAME classification as btc_regime — it is NOT a macro view.
+        result["intraday_regime"] = result["btc_regime"]
 
         self._cache = result
         self._cache_time = now
