@@ -13,6 +13,7 @@ import time
 import sys
 import os
 import json
+import signal
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -36,6 +37,49 @@ RUNNER_EVENTS_FILE = "logs/runner_events.jsonl"
 PLANNED_RESTART_MINUTES = 90
 # Tolerance (seconds) around the planned-restart boundary when classifying.
 PLANNED_RESTART_TOLERANCE_SECONDS = 5 * 60
+
+
+class RunnerShutdown(BaseException):
+    """
+    Raised from a signal handler (SIGTERM/SIGINT/SIGHUP) to trigger a graceful
+    runner shutdown. Inherits from BaseException (not Exception) so the main
+    loop's generic ``except Exception`` cannot swallow it as a loop error.
+    """
+
+    def __init__(self, signum: Optional[int] = None):
+        self.signum = signum
+        super().__init__(f"runner shutdown on signal {signum}")
+
+
+def _signal_name(signum: Optional[int]) -> Optional[str]:
+    if signum is None:
+        return None
+    try:
+        return signal.Signals(signum).name
+    except (ValueError, AttributeError):
+        return str(signum)
+
+
+def _install_signal_handlers() -> None:
+    """
+    Install graceful-shutdown handlers for SIGTERM/SIGINT/SIGHUP.
+
+    The handler simply raises RunnerShutdown in the main thread; the run loop
+    performs the actual child termination and logging. Best-effort: signals not
+    available on the platform (e.g. SIGHUP on Windows) are skipped.
+    """
+    def _handler(signum, frame):
+        raise RunnerShutdown(signum)
+
+    for _sig in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, _sig, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError, RuntimeError):
+            # e.g. not in the main thread, or unsupported on this platform.
+            pass
 
 
 def log_runner_event(event_type: str, **fields) -> None:
@@ -273,12 +317,52 @@ def run_bot():
     def get_child_pid():
         return current_child_pid[0]
 
+    # Tracks the currently-running child so the shutdown path can terminate it
+    # gracefully and log a child_exit even when interrupted by a signal.
+    active_child = {"process": None, "start_ts": None, "restart_index": 0}
+
+    def _shutdown_child() -> None:
+        """Terminate the running child gracefully and log its child_exit."""
+        proc = active_child["process"]
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.terminate()  # SIGTERM
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print("[RUNNER] Child did not exit on SIGTERM; sending SIGKILL")
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except Exception as e:
+                print(f"[RUNNER] Error terminating child during shutdown: {e}")
+        uptime = time.time() - (active_child["start_ts"] or time.time())
+        log_runner_event(
+            "child_exit",
+            child_pid=proc.pid,
+            restart_index=active_child["restart_index"],
+            exit_code=proc.returncode,
+            child_uptime_s=round(uptime, 1),
+            watchdog_triggered=False,
+            classification="runner_shutdown",
+        )
+        active_child["process"] = None
+        current_child_pid[0] = None
+
+    # Install graceful-shutdown signal handlers (SIGTERM/SIGINT/SIGHUP).
+    _install_signal_handlers()
+
     # Start runner-level watchdog
     watchdog = RunnerWatchdog(child_pid_func=get_child_pid)
     watchdog.start()
 
     log_runner_event("runner_start", pid=os.getpid(), bot_args=bot_args)
 
+    shutdown_signal: Optional[int] = None
     try:
         while True:
             restart_count += 1
@@ -298,6 +382,9 @@ def run_bot():
                 print(f"[RUNNER] Child PID: {process.pid}")
 
                 child_start_ts = time.time()
+                active_child["process"] = process
+                active_child["start_ts"] = child_start_ts
+                active_child["restart_index"] = restart_count
                 log_runner_event(
                     "child_start",
                     child_pid=process.pid,
@@ -305,6 +392,7 @@ def run_bot():
                 )
 
                 exit_code = process.wait()
+                active_child["process"] = None
                 current_child_pid[0] = None
                 child_exit_ts = time.time()
                 child_uptime_s = child_exit_ts - child_start_ts
@@ -347,11 +435,9 @@ def run_bot():
                 time.sleep(wait_time)
 
             except KeyboardInterrupt:
-                print()
-                print("=" * 80)
-                print("Keyboard interrupt received - stopping wrapper")
-                print("=" * 80)
-                break
+                # Defer to the outer handler so the child is shut down
+                # gracefully and runner_stop is logged exactly once.
+                raise
 
             except Exception as e:
                 print()
@@ -363,9 +449,29 @@ def run_bot():
                 log_runner_event("runner_loop_error", error=str(e)[:200])
                 time.sleep(10)
 
+    except RunnerShutdown as e:
+        shutdown_signal = e.signum
+        sig_name = _signal_name(shutdown_signal)
+        print()
+        print("=" * 80)
+        print(f"Received {sig_name or 'shutdown signal'} - stopping runner gracefully")
+        print("=" * 80)
+        _shutdown_child()
+
+    except KeyboardInterrupt:
+        print()
+        print("=" * 80)
+        print("Keyboard interrupt received - stopping runner gracefully")
+        print("=" * 80)
+        _shutdown_child()
+
     finally:
         watchdog.stop()
-        log_runner_event("runner_stop", pid=os.getpid())
+        log_runner_event(
+            "runner_stop",
+            pid=os.getpid(),
+            signal=_signal_name(shutdown_signal),
+        )
 
 if __name__ == "__main__":
     try:

@@ -25,6 +25,7 @@ Usage:
     python scripts/run_summary.py --json      # machine-readable JSON
 """
 import json
+import os
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -80,18 +81,46 @@ def load_price_history(log_dir: str = "logs") -> List[Dict[str, Any]]:
     return _read_jsonl(Path(log_dir) / "btc_price_history.jsonl")
 
 
+def _pid_alive(pid: Any) -> bool:
+    """Best-effort check whether a PID is currently running. Never raises."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Aggregation (pure functions — testable)
 # ---------------------------------------------------------------------------
-def summarize_runner_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_runner_events(
+    events: List[Dict[str, Any]],
+    close_ts: Optional[float] = None,
+    active: Optional[bool] = None,
+) -> Dict[str, Any]:
     """
     Build a reliable runtime + restart summary from structured runner events.
 
-    - wall_clock_span_s: first event ts -> last event ts
-    - cumulative_child_uptime_s: sum of child_exit uptimes (+ a still-running
-      child estimated from its child_start to last event)
-    - restart_by_cause: Counter of child_exit classifications (no double count)
-    - watchdog_restart_events: count of explicit watchdog_restart events
+    - wall_clock_span_s: runner_start -> runner_stop when completed; otherwise
+      runner_start (first event) -> effective_end (current time / latest log ts).
+    - cumulative_child_uptime_s: sum of child_exit uptimes, plus a still-open
+      child estimated from its child_start to effective_end.
+    - restart_by_cause: Counter of child_exit classifications (no double count).
+    - watchdog_restart_events: count of explicit watchdog_restart events.
+    - run_status: completed / active / abruptly_stopped /
+      active_or_abruptly_stopped / unknown / no_events.
+
+    Args:
+      close_ts: timestamp used to close any open interval (open child / open
+        run). Pass current time for an active run, or the latest known log
+        timestamp if the process is no longer running. Never moves the end
+        before the last recorded event.
+      active: True/False if liveness is known (drives run_status); None if
+        unknown (yields "active_or_abruptly_stopped").
     """
     result: Dict[str, Any] = {
         "wall_clock_span_s": 0.0,
@@ -104,6 +133,8 @@ def summarize_runner_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "first_event_t": None,
         "last_event_t": None,
         "open_child": False,
+        "open_runner": False,
+        "run_status": "no_events",
     }
     if not events:
         return result
@@ -111,9 +142,17 @@ def summarize_runner_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     ev = sorted(events, key=lambda e: e.get("ts", 0))
     first_ts = ev[0].get("ts", 0)
     last_ts = ev[-1].get("ts", 0)
-    result["wall_clock_span_s"] = round(max(0.0, last_ts - first_ts), 1)
     result["first_event_t"] = ev[0].get("t")
     result["last_event_t"] = ev[-1].get("t")
+
+    has_runner_start = any(e.get("event_type") == "runner_start" for e in ev)
+    has_runner_stop = any(e.get("event_type") == "runner_stop" for e in ev)
+
+    # Timestamp used to close still-open intervals. Never goes backwards before
+    # the last recorded event.
+    effective_end = last_ts
+    if close_ts is not None:
+        effective_end = max(effective_end, close_ts)
 
     causes: Counter = Counter()
     uptime = 0.0
@@ -138,11 +177,32 @@ def summarize_runner_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif et == "runner_loop_error":
             result["runner_loop_errors"] += 1
 
-    # If a child started but we never saw its exit, estimate its uptime from the
-    # last event timestamp (it may still be running).
+    # Open child interval: a child_start with no matching child_exit. Estimate
+    # its uptime up to effective_end (current time if active, else latest log).
     if open_start_ts is not None:
-        uptime += max(0.0, last_ts - open_start_ts)
+        uptime += max(0.0, effective_end - open_start_ts)
         result["open_child"] = True
+
+    # Wall-clock span: avoid reporting 0h00m00s when only runner_start /
+    # child_start were recorded before an abrupt kill. When there is no
+    # runner_stop, extend the span to effective_end (latest known timestamp).
+    if has_runner_stop:
+        result["wall_clock_span_s"] = round(max(0.0, last_ts - first_ts), 1)
+    else:
+        result["wall_clock_span_s"] = round(max(0.0, effective_end - first_ts), 1)
+
+    result["open_runner"] = has_runner_start and not has_runner_stop
+    if has_runner_stop:
+        result["run_status"] = "completed"
+    elif has_runner_start:
+        if active is True:
+            result["run_status"] = "active"
+        elif active is False:
+            result["run_status"] = "abruptly_stopped"
+        else:
+            result["run_status"] = "active_or_abruptly_stopped"
+    else:
+        result["run_status"] = "unknown"
 
     result["cumulative_child_uptime_s"] = round(uptime, 1)
     result["child_starts"] = starts
@@ -189,18 +249,49 @@ def _span_seconds(records: List[Dict[str, Any]]) -> float:
     return round(max(ts) - min(ts), 1) if len(ts) >= 2 else 0.0
 
 
-def build_summary(log_dir: str = "logs") -> Dict[str, Any]:
+def build_summary(log_dir: str = "logs", now_ts: Optional[float] = None) -> Dict[str, Any]:
     events = load_runner_events(log_dir)
     orders = load_simulated_orders(log_dir)
     regimes = load_regime_snapshots(log_dir)
     prices = load_price_history(log_dir)
 
-    runner = summarize_runner_events(events)
+    # Determine whether the runner is still alive and the latest trustworthy
+    # timestamp to close an open interval. An open run (runner_start without
+    # runner_stop) is estimated to current time if active, else to the latest
+    # known log timestamp across all sources.
+    runner_pid: Any = None
+    has_stop = False
+    for e in events:
+        et = e.get("event_type")
+        if et == "runner_start":
+            runner_pid = e.get("pid", runner_pid)
+        elif et == "runner_stop":
+            has_stop = True
+
+    active_known = bool(runner_pid) and not has_stop
+    active = _pid_alive(runner_pid) if active_known else False
+
+    all_ts: List[float] = [e.get("ts") for e in events if e.get("ts")]
+    all_ts += [r.get("ts") for r in regimes if r.get("ts")]
+    all_ts += [p.get("ts") for p in prices if p.get("ts")]
+    latest_log_ts = max(all_ts) if all_ts else None
+
+    now = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
+    close_ts = now if active else latest_log_ts
+
+    runner = summarize_runner_events(
+        events, close_ts=close_ts, active=active if active_known else None
+    )
     trades = summarize_trades(orders)
 
     regime_counts = Counter(r.get("combined_regime", "unavailable") for r in regimes)
 
     warnings: List[str] = []
+    if runner["run_status"] in ("abruptly_stopped", "active_or_abruptly_stopped"):
+        warnings.append(
+            "runner_stop not recorded — run is active or was stopped abruptly; "
+            "uptime/span estimated to the latest known timestamp"
+        )
     if runner["watchdog_restart_events"] > 0:
         warnings.append(
             f"{runner['watchdog_restart_events']} watchdog restart(s) — investigate child stalls"
@@ -257,9 +348,11 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print("RUN SUMMARY (reliable, structured)")
     print("=" * 70)
     print(f"Generated:            {summary['generated_at']}")
+    print(f"RUN STATUS:           {r['run_status']}")
     print(f"First event:          {r['first_event_t']}")
     print(f"Last event:           {r['last_event_t']}")
-    print(f"Wall-clock span:      {_fmt_hms(r['wall_clock_span_s'])}")
+    print(f"Wall-clock span:      {_fmt_hms(r['wall_clock_span_s'])}"
+          + ("  (estimated — runner_stop not recorded)" if r["open_runner"] else ""))
     print(f"Cumulative uptime:    {_fmt_hms(r['cumulative_child_uptime_s'])}"
           + (" (a child may still be running)" if r["open_child"] else ""))
     print(f"Child starts/exits:   {r['child_starts']} / {r['child_exits']}")

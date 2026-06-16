@@ -103,3 +103,78 @@ def test_build_summary_warns_on_watchdog(tmp_path, monkeypatch):
     assert "watchdog" in joined
     assert "external sigterm" in joined
     assert "preliminary" in joined  # 0 trades < threshold
+
+
+# ---------------------------------------------------------------------------
+# Open-interval / abrupt-stop handling (smoke-test reporting fix)
+# ---------------------------------------------------------------------------
+def _open_run_events():
+    """runner_start + child_start only — the abrupt-kill smoke-test scenario."""
+    base = 1_000_000.0
+    return [
+        {"ts": base, "t": "t0", "event_type": "runner_start", "pid": 999_999},
+        {"ts": base + 1, "t": "t0", "event_type": "child_start", "child_pid": 1, "restart_index": 1},
+    ]
+
+
+def test_open_interval_nonzero_with_close_ts():
+    base = 1_000_000.0
+    # Close the open interval 45 minutes after start (e.g. latest regime ts).
+    out = rs.summarize_runner_events(_open_run_events(), close_ts=base + 45 * 60, active=False)
+    assert out["open_child"] is True
+    assert out["open_runner"] is True
+    assert out["wall_clock_span_s"] == 45 * 60          # NOT zero
+    # child_start is at base+1, closed at base+2700 -> 2699s
+    assert out["cumulative_child_uptime_s"] == 45 * 60 - 1
+    assert out["run_status"] == "abruptly_stopped"
+
+
+def test_open_interval_active_status():
+    out = rs.summarize_runner_events(_open_run_events(), close_ts=1_000_000.0 + 600, active=True)
+    assert out["run_status"] == "active"
+    assert out["wall_clock_span_s"] > 0
+
+
+def test_open_interval_unknown_status():
+    out = rs.summarize_runner_events(_open_run_events(), close_ts=1_000_000.0 + 600, active=None)
+    assert out["run_status"] == "active_or_abruptly_stopped"
+
+
+def test_build_summary_abrupt_stop_not_zero(tmp_path):
+    # Reproduce the smoke test: runner_start + child_start, no child_exit / stop,
+    # but regime snapshots advance the latest known timestamp by ~45 min.
+    import json
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = 1_000_000.0
+    with open(logs / "runner_events.jsonl", "w") as f:
+        for e in _open_run_events():
+            f.write(json.dumps(e) + "\n")
+    with open(logs / "btc_regime_history.jsonl", "w") as f:
+        for i in range(10):
+            f.write(json.dumps({"ts": base + i * 300, "combined_regime": "macro_bear|neutral"}) + "\n")
+    # pid 999999 is not alive -> abruptly_stopped, closed to latest log ts.
+    summary = rs.build_summary(log_dir=str(logs))
+    r = summary["runner"]
+    assert r["run_status"] == "abruptly_stopped"
+    assert r["wall_clock_span_s"] > 0                    # NOT 0h00m00s
+    assert r["cumulative_child_uptime_s"] > 0
+    joined = " ".join(summary["warnings"]).lower()
+    assert "runner_stop not recorded" in joined
+
+
+def test_completed_run_status():
+    base = 1_000_000.0
+    events = [
+        {"ts": base, "t": "t0", "event_type": "runner_start", "pid": 1},
+        {"ts": base, "t": "t0", "event_type": "child_start", "child_pid": 1},
+        {"ts": base + 3600, "t": "t1", "event_type": "child_exit", "child_pid": 1,
+         "child_uptime_s": 3600, "classification": "runner_shutdown"},
+        {"ts": base + 3600, "t": "t1", "event_type": "runner_stop", "pid": 1},
+    ]
+    out = rs.summarize_runner_events(events, close_ts=base + 9999, active=False)
+    assert out["run_status"] == "completed"
+    assert out["open_runner"] is False
+    # completed run ignores close_ts for the span
+    assert out["wall_clock_span_s"] == 3600
+

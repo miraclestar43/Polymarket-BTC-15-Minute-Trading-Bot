@@ -153,6 +153,29 @@ python run_bot.py --test-mode
 # Live trading mode (REAL MONEY!)
 python 15m_bot_runner.py --live
 ```
+
+## Stopping the runner (graceful)
+
+The runner installs SIGTERM/SIGINT/SIGHUP handlers. On any of these it
+gracefully terminates the child bot, logs a `child_exit` and a `runner_stop`
+event to `logs/runner_events.jsonl`, and exits. This keeps the run summary
+accurate (correct wall-clock span and cumulative uptime).
+
+**Prefer signalling the runner process over `tmux kill-session`.** Killing the
+tmux session sends SIGKILL/teardown that can skip the shutdown logging.
+
+```bash
+# Find the runner PID (the process running 15m_bot_runner.py)
+pgrep -f 15m_bot_runner.py
+
+# Graceful stop: send SIGTERM and wait for it to exit
+kill -TERM <RUNNER_PID>
+
+# Only if it has not exited after ~30s, fall back to killing the tmux session
+tmux kill-session -t <session>
+
+# Press Ctrl-C inside the runner's tmux pane also triggers a graceful stop.
+```
 ## ⚙️ Configuration Options
 Argument	Description	Default
 --test-mode	Trade every minute for testing	False

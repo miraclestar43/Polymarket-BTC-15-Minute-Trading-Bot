@@ -71,3 +71,38 @@ def test_log_runner_event_never_raises(monkeypatch):
             raise RuntimeError("no fs")
     monkeypatch.setattr(runner, "project_root", Boom())
     runner.log_runner_event("child_exit", classification="planned_restart")  # no exception
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown machinery — must NOT alter restart classification.
+# ---------------------------------------------------------------------------
+def test_runner_shutdown_is_base_exception():
+    # Inheriting BaseException keeps it from being swallowed by `except Exception`.
+    assert issubclass(runner.RunnerShutdown, BaseException)
+    assert not issubclass(runner.RunnerShutdown, Exception)
+
+
+def test_runner_shutdown_carries_signum():
+    exc = runner.RunnerShutdown(15)
+    assert exc.signum == 15
+
+
+def test_signal_name_resolves():
+    import signal as _signal
+    assert runner._signal_name(_signal.SIGTERM) == "SIGTERM"
+    assert runner._signal_name(None) is None
+
+
+def test_shutdown_does_not_change_classification():
+    # The shutdown path logs classification="runner_shutdown" directly; the
+    # normal classify_exit() logic is unchanged for every signal/uptime case.
+    assert runner.classify_exit(-15, 90 * 60, False) == "planned_restart"
+    assert runner.classify_exit(-15, 60, False) == "external_sigterm"
+    assert runner.classify_exit(-15, 90 * 60, True) == "watchdog_restart"
+    assert runner.classify_exit(0, 60, False) == "clean_exit"
+    assert runner.classify_exit(1, 60, False) == "crash_error"
+    # "runner_shutdown" is never produced by classify_exit.
+    for code in (-15, 0, 1, 143):
+        for up in (0, 60, 5400):
+            assert runner.classify_exit(code, up, False) != "runner_shutdown"
+
