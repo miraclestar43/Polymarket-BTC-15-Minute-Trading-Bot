@@ -15,7 +15,7 @@ import os
 import json
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 project_root = Path(__file__).parent
@@ -27,6 +27,72 @@ JOURNAL_DIR = "logs"
 SHADOW_DIR = "logs"
 STALE_THRESHOLD_SECONDS = 45 * 60  # 45 minutes
 WATCHDOG_CHECK_INTERVAL = 60  # Check every 60 seconds
+
+# Structured lifecycle event log (append-only, source of truth for run summaries)
+RUNNER_EVENTS_FILE = "logs/runner_events.jsonl"
+
+# The child bot performs a planned self-restart after this many minutes
+# (see bot.py `restart_after_minutes`). Used to classify signal-terminated exits.
+PLANNED_RESTART_MINUTES = 90
+# Tolerance (seconds) around the planned-restart boundary when classifying.
+PLANNED_RESTART_TOLERANCE_SECONDS = 5 * 60
+
+
+def log_runner_event(event_type: str, **fields) -> None:
+    """
+    Append a single structured lifecycle event to RUNNER_EVENTS_FILE.
+
+    Fail-safe: never raises. Best-effort persistence only.
+    """
+    record = {
+        "ts": round(time.time(), 3),
+        "t": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+    }
+    record.update(fields)
+    try:
+        path = project_root / RUNNER_EVENTS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
+def classify_exit(
+    exit_code: Optional[int],
+    child_uptime_s: float,
+    watchdog_triggered: bool,
+    planned_restart_minutes: int = PLANNED_RESTART_MINUTES,
+    planned_tolerance_s: int = PLANNED_RESTART_TOLERANCE_SECONDS,
+) -> str:
+    """
+    Classify why a child bot process exited.
+
+    Returns one of:
+      - "watchdog_restart"  : the runner watchdog killed the child
+      - "planned_restart"   : the bot self-terminated near its planned restart age
+      - "external_sigterm"  : signal-terminated early, not by our watchdog
+      - "clean_exit"        : exited 0 (unexpected for this bot's main loop)
+      - "crash_error"       : non-zero/abnormal exit
+
+    Notes:
+      Signal termination shows up as a negative code (e.g. -15) from
+      subprocess.wait(), or 143 (128+SIGTERM) when shell-wrapped. Exit code
+      alone cannot distinguish planned vs watchdog vs external, so we use the
+      watchdog flag and the child's uptime.
+    """
+    signal_terminated = exit_code in (-15, 15, 143)
+    if watchdog_triggered:
+        return "watchdog_restart"
+    if signal_terminated:
+        planned_floor = planned_restart_minutes * 60 - planned_tolerance_s
+        if child_uptime_s >= planned_floor:
+            return "planned_restart"
+        return "external_sigterm"
+    if exit_code == 0:
+        return "clean_exit"
+    return "crash_error"
 
 
 class RunnerWatchdog:
@@ -42,6 +108,9 @@ class RunnerWatchdog:
         self._thread = None
         self._last_restart_time = 0
         self._restart_cooldown = 120  # Minimum 2 minutes between restarts
+        # Records the most recent watchdog-initiated restart so the main loop
+        # can attribute a child exit to the watchdog (keyed by child PID).
+        self.last_restart = {"pid": None, "ts": 0.0, "reason": None}
 
     def start(self):
         """Start the watchdog monitoring thread."""
@@ -139,6 +208,16 @@ class RunnerWatchdog:
         print(f"[WATCHDOG] === END DIAGNOSTICS ===")
 
         self._last_restart_time = now
+        # Attribute this child's upcoming exit to the watchdog (by PID).
+        self.last_restart = {"pid": child_pid, "ts": now, "reason": reason}
+        log_runner_event(
+            "watchdog_restart",
+            child_pid=child_pid,
+            reason=reason,
+            heartbeat_age_s=round(heartbeat_age, 1) if heartbeat_age is not None else None,
+            journal_age_s=round(journal_age, 1) if journal_age is not None else None,
+            shadow_age_s=round(shadow_age, 1) if shadow_age is not None else None,
+        )
 
         # Try graceful termination first
         try:
@@ -198,6 +277,8 @@ def run_bot():
     watchdog = RunnerWatchdog(child_pid_func=get_child_pid)
     watchdog.start()
 
+    log_runner_event("runner_start", pid=os.getpid(), bot_args=bot_args)
+
     try:
         while True:
             restart_count += 1
@@ -216,21 +297,50 @@ def run_bot():
                 current_child_pid[0] = process.pid
                 print(f"[RUNNER] Child PID: {process.pid}")
 
+                child_start_ts = time.time()
+                log_runner_event(
+                    "child_start",
+                    child_pid=process.pid,
+                    restart_index=restart_count,
+                )
+
                 exit_code = process.wait()
                 current_child_pid[0] = None
+                child_exit_ts = time.time()
+                child_uptime_s = child_exit_ts - child_start_ts
+
+                # Attribute the exit: did our watchdog kill THIS child?
+                watchdog_triggered = (
+                    watchdog.last_restart.get("pid") == process.pid
+                )
+                classification = classify_exit(
+                    exit_code=exit_code,
+                    child_uptime_s=child_uptime_s,
+                    watchdog_triggered=watchdog_triggered,
+                )
+                log_runner_event(
+                    "child_exit",
+                    child_pid=process.pid,
+                    restart_index=restart_count,
+                    exit_code=exit_code,
+                    child_uptime_s=round(child_uptime_s, 1),
+                    watchdog_triggered=watchdog_triggered,
+                    watchdog_reason=watchdog.last_restart.get("reason") if watchdog_triggered else None,
+                    classification=classification,
+                )
 
                 print()
                 print("=" * 80)
                 print(f"Bot stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"Exit code: {exit_code}")
+                print(f"Exit code: {exit_code} | uptime: {child_uptime_s:.0f}s | cause: {classification}")
                 print("=" * 80)
 
-                if exit_code in [0, 143, 15, -15]:
-                    print("Normal auto-restart - loading fresh filters...")
-                    wait_time = 2
-                else:
+                if classification == "crash_error":
                     print(f"Error detected (code {exit_code}) - waiting before retry...")
                     wait_time = 10
+                else:
+                    print(f"{classification} - loading fresh filters...")
+                    wait_time = 2
 
                 print(f"Restarting in {wait_time} seconds...")
                 print()
@@ -250,10 +360,12 @@ def run_bot():
                 print("=" * 80)
                 print("Waiting 10 seconds before retry...")
                 print()
+                log_runner_event("runner_loop_error", error=str(e)[:200])
                 time.sleep(10)
 
     finally:
         watchdog.stop()
+        log_runner_event("runner_stop", pid=os.getpid())
 
 if __name__ == "__main__":
     try:

@@ -33,6 +33,9 @@ from typing import Any, Dict, List, Optional
 # Max seconds between a trade and a regime snapshot for the join to be trusted.
 _MAX_JOIN_GAP_SECONDS = 30 * 60  # 30 minutes
 
+# Per-bucket trade count below which results are flagged PRELIMINARY.
+_SMALL_SAMPLE_THRESHOLD = 30
+
 
 # ---------------------------------------------------------------------------
 # Loaders
@@ -205,10 +208,11 @@ def _print_dimension(title: str, report: Dict[str, Dict[str, Any]]) -> None:
             if s["trades"] == 0:
                 print(f"  {side.upper():5}: 0 trades")
                 continue
+            prelim = "  [PRELIMINARY n<%d]" % _SMALL_SAMPLE_THRESHOLD if s["trades"] < _SMALL_SAMPLE_THRESHOLD else ""
             print(
                 f"  {side.upper():5}: {s['trades']} trades, "
                 f"{s['wins']}W/{s['losses']}L, WR={s['win_rate']:.0f}%, "
-                f"P/L=${s['total_pnl']:+.4f}, avg=${s['avg_pnl']:+.4f}"
+                f"P/L=${s['total_pnl']:+.4f}, avg=${s['avg_pnl']:+.4f}{prelim}"
             )
 
 
@@ -228,6 +232,10 @@ def main() -> None:
           f"(<= {_MAX_JOIN_GAP_SECONDS // 60} min)")
     print("NOTE: actual-trade analysis uses realized simulated_pnl only; "
           "shadow market resolution is NOT used.")
+    if len(orders) < _SMALL_SAMPLE_THRESHOLD:
+        print(f"*** PRELIMINARY: only {len(orders)} actual trades "
+              f"(< {_SMALL_SAMPLE_THRESHOLD}); per-regime results are NOT "
+              "statistically reliable. ***")
 
     _print_dimension("BY MACRO REGIME", report_by_dimension(joined, "macro_regime"))
     _print_dimension("BY INTRADAY REGIME", report_by_dimension(joined, "intraday_regime"))
