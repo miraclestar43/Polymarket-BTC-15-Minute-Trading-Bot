@@ -37,6 +37,7 @@ env/
 .env/
 ENV/
 venv.bak/
+.venv-py311-backup/
 
 # Python cache
 __pycache__/
