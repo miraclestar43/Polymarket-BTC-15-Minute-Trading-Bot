@@ -152,9 +152,17 @@ class RunnerWatchdog:
         self._thread = None
         self._last_restart_time = 0
         self._restart_cooldown = 120  # Minimum 2 minutes between restarts
+        # Timestamp marking the start of the current run session. Journal/shadow
+        # staleness is only evaluated against files written at/after this time,
+        # so stale files from PREVIOUS runs/days never trigger a restart.
+        self.run_start_ts: Optional[float] = None
         # Records the most recent watchdog-initiated restart so the main loop
         # can attribute a child exit to the watchdog (keyed by child PID).
         self.last_restart = {"pid": None, "ts": 0.0, "reason": None}
+
+    def set_run_start(self, ts: float) -> None:
+        """Mark the current run session start (used to scope journal staleness)."""
+        self.run_start_ts = ts
 
     def start(self):
         """Start the watchdog monitoring thread."""
@@ -199,8 +207,13 @@ class RunnerWatchdog:
             self._restart_child(child_pid, "heartbeat_stale")
             return
 
-        # Check journal freshness
-        journal_age = self._get_newest_file_age(JOURNAL_DIR, "trade_journal_*.jsonl")
+        # Check journal freshness. Only consider journal files from the CURRENT
+        # run session; files from previous runs/days are ignored. If no
+        # current-run journal exists yet, skip this check (the heartbeat above
+        # is the primary liveness signal) to avoid a false journal_stale loop.
+        journal_age = self._get_newest_file_age(
+            JOURNAL_DIR, "trade_journal_*.jsonl", min_mtime=self.run_start_ts
+        )
         if journal_age is not None and journal_age > self.stale_threshold * 2:
             print(f"[WATCHDOG] Journal stale for {journal_age:.0f}s")
             self._restart_child(child_pid, "journal_stale")
@@ -217,15 +230,31 @@ class RunnerWatchdog:
             pass
         return None
 
-    def _get_newest_file_age(self, directory: str, pattern: str) -> Optional[float]:
-        """Get age of the newest file matching pattern in seconds."""
+    def _get_newest_file_age(
+        self, directory: str, pattern: str, min_mtime: Optional[float] = None
+    ) -> Optional[float]:
+        """
+        Get age (seconds) of the newest file matching pattern.
+
+        If ``min_mtime`` is provided, only files modified at/after that time are
+        considered (used to ignore stale files from previous run sessions).
+        Returns None when no qualifying file exists.
+        """
         try:
             dir_path = project_root / directory
             if not dir_path.exists():
                 return None
-            files = sorted(dir_path.glob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)
-            if files:
-                return time.time() - files[0].stat().st_mtime
+            candidates = []
+            for f in dir_path.glob(pattern):
+                try:
+                    mtime = f.stat().st_mtime
+                except OSError:
+                    continue
+                if min_mtime is not None and mtime < min_mtime:
+                    continue
+                candidates.append(mtime)
+            if candidates:
+                return time.time() - max(candidates)
         except Exception:
             pass
         return None
@@ -237,10 +266,15 @@ class RunnerWatchdog:
             print(f"[WATCHDOG] Cooldown active, skipping restart")
             return
 
-        # Gather diagnostic info before restart
+        # Gather diagnostic info before restart (scoped to the current run
+        # session so the logged ages match what the health check evaluates).
         heartbeat_age = self._get_file_age(HEARTBEAT_FILE)
-        journal_age = self._get_newest_file_age(JOURNAL_DIR, "trade_journal_*.jsonl")
-        shadow_age = self._get_newest_file_age(SHADOW_DIR, "shadow_decisions_*.jsonl")
+        journal_age = self._get_newest_file_age(
+            JOURNAL_DIR, "trade_journal_*.jsonl", min_mtime=self.run_start_ts
+        )
+        shadow_age = self._get_newest_file_age(
+            SHADOW_DIR, "shadow_decisions_*.jsonl", min_mtime=self.run_start_ts
+        )
 
         print(f"[WATCHDOG] === RESTART DIAGNOSTICS ===")
         print(f"[WATCHDOG] Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -358,6 +392,7 @@ def run_bot():
 
     # Start runner-level watchdog
     watchdog = RunnerWatchdog(child_pid_func=get_child_pid)
+    watchdog.set_run_start(time.time())
     watchdog.start()
 
     log_runner_event("runner_start", pid=os.getpid(), bot_args=bot_args)

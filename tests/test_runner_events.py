@@ -106,3 +106,85 @@ def test_shutdown_does_not_change_classification():
         for up in (0, 60, 5400):
             assert runner.classify_exit(code, up, False) != "runner_shutdown"
 
+
+# ---------------------------------------------------------------------------
+# Watchdog journal staleness must be scoped to the CURRENT run session.
+# Files from previous runs/days must NOT trigger journal_stale restarts.
+# ---------------------------------------------------------------------------
+import os as _os
+import time as _time
+
+
+def _make_journal(dir_path, name, age_seconds):
+    f = dir_path / name
+    f.write_text('{"event_type": "simulated_order"}\n')
+    mtime = _time.time() - age_seconds
+    _os.utime(f, (mtime, mtime))
+    return f
+
+
+def _watchdog_with_root(monkeypatch, tmp_path):
+    (tmp_path / "logs").mkdir()
+    monkeypatch.setattr(runner, "project_root", tmp_path)
+    return runner.RunnerWatchdog(child_pid_func=lambda: 4242)
+
+
+def test_old_journal_ignored_when_scoped_to_run_start(monkeypatch, tmp_path):
+    wd = _watchdog_with_root(monkeypatch, tmp_path)
+    logs = tmp_path / "logs"
+    # A journal from a previous run, 3 hours old.
+    _make_journal(logs, "trade_journal_2026-06-15.jsonl", age_seconds=3 * 3600)
+    # The current run started just now.
+    wd.set_run_start(_time.time())
+    # Scoped check: the old file is excluded -> no current-run journal -> None.
+    age = wd._get_newest_file_age(runner.JOURNAL_DIR, "trade_journal_*.jsonl",
+                                  min_mtime=wd.run_start_ts)
+    assert age is None
+
+
+def test_current_run_journal_is_seen(monkeypatch, tmp_path):
+    wd = _watchdog_with_root(monkeypatch, tmp_path)
+    logs = tmp_path / "logs"
+    wd.set_run_start(_time.time() - 600)  # run started 10 min ago
+    # A journal written 5 min ago (within the current run).
+    _make_journal(logs, "trade_journal_2026-06-16.jsonl", age_seconds=300)
+    age = wd._get_newest_file_age(runner.JOURNAL_DIR, "trade_journal_*.jsonl",
+                                  min_mtime=wd.run_start_ts)
+    assert age is not None
+    assert 250 < age < 360
+
+
+def test_check_health_does_not_restart_on_old_journal(monkeypatch, tmp_path):
+    wd = _watchdog_with_root(monkeypatch, tmp_path)
+    logs = tmp_path / "logs"
+    # Fresh heartbeat (healthy), but only an OLD journal from a previous run.
+    hb = logs / "bot_heartbeat.json"
+    hb.write_text("{}")  # fresh mtime
+    _make_journal(logs, "trade_journal_2026-06-15.jsonl", age_seconds=10000)
+    wd.set_run_start(_time.time())
+
+    monkeypatch.setattr(runner.os, "kill", lambda *a, **k: None)  # child "alive"
+    calls = []
+    monkeypatch.setattr(wd, "_restart_child", lambda pid, reason: calls.append(reason))
+
+    wd._check_health()
+    assert calls == []  # old journal must NOT trigger a restart
+
+
+def test_check_health_still_restarts_on_stale_heartbeat(monkeypatch, tmp_path):
+    wd = _watchdog_with_root(monkeypatch, tmp_path)
+    logs = tmp_path / "logs"
+    hb = logs / "bot_heartbeat.json"
+    hb.write_text("{}")
+    old = _time.time() - (runner.STALE_THRESHOLD_SECONDS + 600)
+    _os.utime(hb, (old, old))
+    wd.set_run_start(_time.time())
+
+    monkeypatch.setattr(runner.os, "kill", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(wd, "_restart_child", lambda pid, reason: calls.append(reason))
+
+    wd._check_health()
+    assert calls == ["heartbeat_stale"]  # genuine stall still detected
+
+
