@@ -81,6 +81,80 @@ def load_simulated_orders(date_str: str = "", log_dir: str = "logs") -> List[Dic
 
 
 # ---------------------------------------------------------------------------
+# Run-window scoping (analyze ONE clean run, not mixed historical data)
+# ---------------------------------------------------------------------------
+def _parse_when(value: Optional[str]) -> Optional[float]:
+    """Parse a --since/--until value (epoch seconds or ISO-8601) to a ts."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def latest_run_window(log_dir: str = "logs") -> Optional[Dict[str, Any]]:
+    """Infer the most recent run's [start_ts, stop_ts] from runner_events.jsonl."""
+    path = Path(log_dir) / "runner_events.jsonl"
+    if not path.exists():
+        return None
+    events: List[Dict[str, Any]] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    starts = [e for e in events if e.get("event_type") == "runner_start" and e.get("ts")]
+    if not starts:
+        return None
+    start = max(starts, key=lambda e: e.get("ts", 0))
+    start_ts = start.get("ts")
+    stops = [
+        e for e in events
+        if e.get("event_type") == "runner_stop" and (e.get("ts") or 0) >= start_ts
+    ]
+    stop = min(stops, key=lambda e: e.get("ts", 0)) if stops else None
+    return {
+        "start_ts": start_ts,
+        "stop_ts": stop.get("ts") if stop else None,
+        "start_t": start.get("t"),
+        "stop_t": stop.get("t") if stop else None,
+    }
+
+
+def filter_orders_window(
+    orders: List[Dict[str, Any]],
+    since: Optional[float],
+    until: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Keep only orders whose timestamp falls within [since, until]."""
+    if since is None and until is None:
+        return orders
+    out: List[Dict[str, Any]] = []
+    for o in orders:
+        t = _to_ts(o.get("timestamp", ""))
+        if t is None:
+            continue
+        if since is not None and t < since:
+            continue
+        if until is not None and t > until:
+            continue
+        out.append(o)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Join
 # ---------------------------------------------------------------------------
 def _to_ts(ts_str: str) -> Optional[float]:
@@ -217,19 +291,62 @@ def _print_dimension(title: str, report: Dict[str, Dict[str, Any]]) -> None:
 
 
 def main() -> None:
+    def _arg_value(flag: str) -> Optional[str]:
+        for i, a in enumerate(sys.argv):
+            if a == flag and i + 1 < len(sys.argv):
+                return sys.argv[i + 1]
+            if a.startswith(flag + "="):
+                return a.split("=", 1)[1]
+        return None
+
+    flags = {"--all", "--latest-run", "--json"}
+    since = _parse_when(_arg_value("--since"))
+    until = _parse_when(_arg_value("--until"))
+    scope_label = None
+
+    if "--latest-run" in sys.argv:
+        win = latest_run_window()
+        if win is None:
+            print("No runner_start events found — cannot infer the latest run.")
+            return
+        since = win["start_ts"]
+        until = win["stop_ts"]
+        scope_label = f"latest run ({win['start_t']} -> {win['stop_t'] or 'OPEN'})"
+
+    # Optional positional date (backwards compatible), ignoring flags/values.
     date_str = ""
-    if len(sys.argv) > 1 and sys.argv[1] not in ("--all",):
-        date_str = sys.argv[1]
+    skip_next = False
+    for a in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--since", "--until"):
+            skip_next = True
+            continue
+        if a in flags or a.startswith("--since=") or a.startswith("--until="):
+            continue
+        date_str = a
+        break
 
     snapshots = load_regime_snapshots()
     orders = load_simulated_orders(date_str)
+    before = len(orders)
+    orders = filter_orders_window(orders, since, until)
     joined = join_trades_to_regime(orders, snapshots)
 
+    if scope_label:
+        print(f"SCOPE: {scope_label}")
+    elif since is not None or until is not None:
+        print(f"SCOPE: custom window since={since} until={until}")
+    else:
+        print("SCOPE: ALL HISTORY (not scoped to one run — use --latest-run)")
     print(f"Loaded {len(snapshots)} regime snapshots")
-    print(f"Loaded {len(orders)} actual simulated orders")
+    print(f"Loaded {len(orders)} actual simulated orders"
+          + (f" (filtered from {before} across all journals)" if (since is not None or until is not None) else ""))
     matched = sum(1 for t in joined if t["join_gap_seconds"] is not None)
     print(f"Joined {matched}/{len(joined)} trades to a nearby regime snapshot "
-          f"(<= {_MAX_JOIN_GAP_SECONDS // 60} min)")
+          f"(<= {_MAX_JOIN_GAP_SECONDS // 60} min); "
+          f"{len(joined) - matched} unmatched (no snapshot within window -> 'unavailable')")
     print("NOTE: actual-trade analysis uses realized simulated_pnl only; "
           "shadow market resolution is NOT used.")
     if len(orders) < _SMALL_SAMPLE_THRESHOLD:

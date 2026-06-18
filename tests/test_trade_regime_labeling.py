@@ -67,3 +67,53 @@ def test_join_uses_pnl_not_shadow():
     rep = atr.report_by_dimension(joined, "macro_regime")
     assert rep["macro_bull"]["short"]["total_pnl"] == 2.5
     assert rep["macro_bull"]["short"]["wins"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Run-window scoping
+# ---------------------------------------------------------------------------
+def test_parse_when_epoch_and_iso():
+    assert atr._parse_when("1000000") == 1_000_000.0
+    assert atr._parse_when(None) is None
+    assert atr._parse_when("") is None
+    assert atr._parse_when("bad") is None
+    iso = atr._parse_when("2026-06-16T05:20:45+00:00")
+    assert iso is not None and abs(iso - 1781587245.0) < 1.0
+
+
+def test_filter_orders_window_inclusive_boundaries():
+    orders = [
+        {"timestamp": "2026-06-16T05:00:00+00:00", "n": 1},
+        {"timestamp": "2026-06-16T06:00:00+00:00", "n": 2},
+        {"timestamp": "2026-06-16T07:00:00+00:00", "n": 3},
+        {"timestamp": "2026-06-16T08:00:00+00:00", "n": 4},
+        {"timestamp": "2026-06-16T09:00:00+00:00", "n": 5},
+    ]
+    since = atr._parse_when("2026-06-16T06:00:00+00:00")
+    until = atr._parse_when("2026-06-16T08:00:00+00:00")
+    kept = [o["n"] for o in atr.filter_orders_window(orders, since, until)]
+    assert kept == [2, 3, 4]
+
+
+def test_latest_run_window_from_events_file(tmp_path):
+    import json
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = 1_700_000_000.0
+    events = [
+        {"ts": base, "t": "r1s", "event_type": "runner_start", "pid": 1},
+        {"ts": base + 100, "t": "r1e", "event_type": "runner_stop", "pid": 1},
+        {"ts": base + 200, "t": "r2s", "event_type": "runner_start", "pid": 2},
+        {"ts": base + 400, "t": "r2e", "event_type": "runner_stop", "pid": 2},
+    ]
+    with open(logs / "runner_events.jsonl", "w") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+    win = atr.latest_run_window(log_dir=str(logs))
+    assert win["start_ts"] == base + 200
+    assert win["stop_ts"] == base + 400
+
+
+def test_latest_run_window_missing_file(tmp_path):
+    assert atr.latest_run_window(log_dir=str(tmp_path / "nope")) is None
+

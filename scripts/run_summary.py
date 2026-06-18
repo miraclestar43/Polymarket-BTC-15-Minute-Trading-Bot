@@ -81,6 +81,103 @@ def load_price_history(log_dir: str = "logs") -> List[Dict[str, Any]]:
     return _read_jsonl(Path(log_dir) / "btc_price_history.jsonl")
 
 
+# ---------------------------------------------------------------------------
+# Run-window scoping (so a report covers ONE clean run, not mixed history)
+# ---------------------------------------------------------------------------
+def parse_when(value: Optional[str]) -> Optional[float]:
+    """Parse a --since/--until value (epoch seconds or ISO-8601) to a ts."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def latest_run_window(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Infer the most recent run's [start_ts, stop_ts] from runner lifecycle events.
+
+    Returns {"start_ts", "stop_ts" (None if still open), "start_t", "stop_t"}
+    or None if there is no runner_start event.
+    """
+    starts = [e for e in events if e.get("event_type") == "runner_start" and e.get("ts")]
+    if not starts:
+        return None
+    start = max(starts, key=lambda e: e.get("ts", 0))
+    start_ts = start.get("ts")
+    stops = [
+        e for e in events
+        if e.get("event_type") == "runner_stop" and (e.get("ts") or 0) >= start_ts
+    ]
+    stop = min(stops, key=lambda e: e.get("ts", 0)) if stops else None
+    return {
+        "start_ts": start_ts,
+        "stop_ts": stop.get("ts") if stop else None,
+        "start_t": start.get("t"),
+        "stop_t": stop.get("t") if stop else None,
+    }
+
+
+def _order_ts(order: Dict[str, Any]) -> Optional[float]:
+    t = order.get("timestamp")
+    if t is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def filter_orders_window(
+    orders: List[Dict[str, Any]],
+    since: Optional[float],
+    until: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Keep only orders whose timestamp falls within [since, until]."""
+    if since is None and until is None:
+        return orders
+    out = []
+    for o in orders:
+        t = _order_ts(o)
+        if t is None:
+            continue
+        if since is not None and t < since:
+            continue
+        if until is not None and t > until:
+            continue
+        out.append(o)
+    return out
+
+
+def filter_events_window(
+    events: List[Dict[str, Any]],
+    since: Optional[float],
+    until: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Keep only runner events whose ts falls within [since, until]."""
+    if since is None and until is None:
+        return events
+    out = []
+    for e in events:
+        t = e.get("ts")
+        if t is None:
+            continue
+        if since is not None and t < since:
+            continue
+        if until is not None and t > until:
+            continue
+        out.append(e)
+    return out
+
+
 def _pid_alive(pid: Any) -> bool:
     """Best-effort check whether a PID is currently running. Never raises."""
     try:
@@ -249,11 +346,26 @@ def _span_seconds(records: List[Dict[str, Any]]) -> float:
     return round(max(ts) - min(ts), 1) if len(ts) >= 2 else 0.0
 
 
-def build_summary(log_dir: str = "logs", now_ts: Optional[float] = None) -> Dict[str, Any]:
+def build_summary(
+    log_dir: str = "logs",
+    now_ts: Optional[float] = None,
+    since: Optional[float] = None,
+    until: Optional[float] = None,
+    window_label: Optional[str] = None,
+) -> Dict[str, Any]:
     events = load_runner_events(log_dir)
     orders = load_simulated_orders(log_dir)
     regimes = load_regime_snapshots(log_dir)
     prices = load_price_history(log_dir)
+
+    # Scope everything to the requested run window so the report reflects ONE
+    # clean run, not mixed historical data.
+    scoped = since is not None or until is not None
+    if scoped:
+        events = filter_events_window(events, since, until)
+        orders = filter_orders_window(orders, since, until)
+        regimes = filter_events_window(regimes, since, until)
+        prices = filter_events_window(prices, since, until)
 
     # Determine whether the runner is still alive and the latest trustworthy
     # timestamp to close an open interval. An open run (runner_start without
@@ -278,6 +390,9 @@ def build_summary(log_dir: str = "logs", now_ts: Optional[float] = None) -> Dict
 
     now = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
     close_ts = now if active else latest_log_ts
+    # When scoped to a closed window, never estimate past the window end.
+    if until is not None and not active:
+        close_ts = until
 
     runner = summarize_runner_events(
         events, close_ts=close_ts, active=active if active_known else None
@@ -315,6 +430,12 @@ def build_summary(log_dir: str = "logs", now_ts: Optional[float] = None) -> Dict
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window": {
+            "scoped": scoped,
+            "label": window_label,
+            "since_ts": since,
+            "until_ts": until,
+        },
         "runner": runner,
         "trades": trades,
         "regime_snapshots": {
@@ -348,6 +469,15 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print("RUN SUMMARY (reliable, structured)")
     print("=" * 70)
     print(f"Generated:            {summary['generated_at']}")
+    w = summary.get("window", {})
+    if w.get("scoped"):
+        print(f"SCOPE:                {w.get('label') or 'custom window'}")
+        if w.get("since_ts") is not None:
+            print(f"  since:              {datetime.fromtimestamp(w['since_ts'], timezone.utc).isoformat()}")
+        if w.get("until_ts") is not None:
+            print(f"  until:              {datetime.fromtimestamp(w['until_ts'], timezone.utc).isoformat()}")
+    else:
+        print("SCOPE:                ALL HISTORY (not scoped to one run — use --latest-run)")
     print(f"RUN STATUS:           {r['run_status']}")
     print(f"First event:          {r['first_event_t']}")
     print(f"Last event:           {r['last_event_t']}")
@@ -393,9 +523,33 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print()
 
 
+def _arg_value(flag: str) -> Optional[str]:
+    """Read `--flag value` or `--flag=value` from sys.argv."""
+    for i, a in enumerate(sys.argv):
+        if a == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def main() -> None:
     as_json = "--json" in sys.argv
-    summary = build_summary()
+    since = parse_when(_arg_value("--since"))
+    until = parse_when(_arg_value("--until"))
+    label = None
+
+    if "--latest-run" in sys.argv:
+        win = latest_run_window(load_runner_events())
+        if win is None:
+            print("No runner_start events found — cannot infer the latest run.",
+                  file=sys.stderr)
+            sys.exit(1)
+        since = win["start_ts"]
+        until = win["stop_ts"]
+        label = f"latest run ({win['start_t']} -> {win['stop_t'] or 'OPEN'})"
+
+    summary = build_summary(since=since, until=until, window_label=label)
     if as_json:
         print(json.dumps(summary, indent=2))
     else:

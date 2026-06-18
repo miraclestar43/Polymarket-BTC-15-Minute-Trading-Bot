@@ -178,3 +178,113 @@ def test_completed_run_status():
     # completed run ignores close_ts for the span
     assert out["wall_clock_span_s"] == 3600
 
+
+# ---------------------------------------------------------------------------
+# Run-window scoping
+# ---------------------------------------------------------------------------
+def test_parse_when_epoch_and_iso():
+    assert rs.parse_when("1000000") == 1_000_000.0
+    assert rs.parse_when("1000000.5") == 1_000_000.5
+    assert rs.parse_when(None) is None
+    assert rs.parse_when("") is None
+    assert rs.parse_when("not-a-date") is None
+    iso = rs.parse_when("2026-06-16T05:20:45+00:00")
+    assert iso is not None and abs(iso - 1781587245.0) < 1.0
+
+
+def test_latest_run_window_picks_most_recent_start():
+    base = 1_000_000.0
+    events = [
+        {"ts": base, "t": "a", "event_type": "runner_start", "pid": 1},
+        {"ts": base + 100, "t": "b", "event_type": "runner_stop", "pid": 1},
+        {"ts": base + 200, "t": "c", "event_type": "runner_start", "pid": 2},
+        {"ts": base + 400, "t": "d", "event_type": "runner_stop", "pid": 2},
+    ]
+    win = rs.latest_run_window(events)
+    assert win["start_ts"] == base + 200
+    assert win["stop_ts"] == base + 400
+
+
+def test_latest_run_window_open_run():
+    base = 1_000_000.0
+    events = [
+        {"ts": base, "t": "a", "event_type": "runner_start", "pid": 1},
+        {"ts": base + 100, "t": "b", "event_type": "runner_stop", "pid": 1},
+        {"ts": base + 200, "t": "c", "event_type": "runner_start", "pid": 2},
+    ]
+    win = rs.latest_run_window(events)
+    assert win["start_ts"] == base + 200
+    assert win["stop_ts"] is None
+
+
+def test_latest_run_window_no_starts():
+    assert rs.latest_run_window([]) is None
+
+
+def test_filter_orders_window_boundaries():
+    orders = [
+        {"timestamp": "2026-06-16T05:00:00+00:00", "n": 1},   # before
+        {"timestamp": "2026-06-16T06:00:00+00:00", "n": 2},   # at since
+        {"timestamp": "2026-06-16T07:00:00+00:00", "n": 3},   # inside
+        {"timestamp": "2026-06-16T08:00:00+00:00", "n": 4},   # at until
+        {"timestamp": "2026-06-16T09:00:00+00:00", "n": 5},   # after
+    ]
+    since = rs.parse_when("2026-06-16T06:00:00+00:00")
+    until = rs.parse_when("2026-06-16T08:00:00+00:00")
+    kept = [o["n"] for o in rs.filter_orders_window(orders, since, until)]
+    assert kept == [2, 3, 4]  # inclusive boundaries
+
+
+def test_filter_events_window_boundaries():
+    base = 1_000_000.0
+    events = [{"ts": base + i * 100, "n": i} for i in range(5)]
+    kept = [e["n"] for e in rs.filter_events_window(events, base + 100, base + 300)]
+    assert kept == [1, 2, 3]
+
+
+def test_build_summary_scoped_window(tmp_path):
+    import json
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = 1_700_000_000.0
+    # Two runs in the events file; only the second should be reported.
+    events = [
+        {"ts": base, "t": "r1s", "event_type": "runner_start", "pid": 1},
+        {"ts": base, "t": "r1s", "event_type": "child_start", "child_pid": 1},
+        {"ts": base + 3600, "t": "r1e", "event_type": "child_exit", "child_pid": 1,
+         "child_uptime_s": 3600, "classification": "clean_exit"},
+        {"ts": base + 3600, "t": "r1e", "event_type": "runner_stop", "pid": 1},
+        {"ts": base + 7200, "t": "r2s", "event_type": "runner_start", "pid": 2},
+        {"ts": base + 7200, "t": "r2s", "event_type": "child_start", "child_pid": 2},
+        {"ts": base + 10800, "t": "r2e", "event_type": "child_exit", "child_pid": 2,
+         "child_uptime_s": 3600, "classification": "runner_shutdown"},
+        {"ts": base + 10800, "t": "r2e", "event_type": "runner_stop", "pid": 2},
+    ]
+    with open(logs / "runner_events.jsonl", "w") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+
+    def _iso(ts):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+    with open(logs / "trade_journal_2026.jsonl", "w") as f:
+        # one trade in run 1, one trade in run 2
+        f.write(json.dumps({"event_type": "simulated_order", "side": "long",
+                            "simulated_pnl": -1.0, "timestamp": _iso(base + 100)}) + "\n")
+        f.write(json.dumps({"event_type": "simulated_order", "side": "short",
+                            "simulated_pnl": 2.0, "timestamp": _iso(base + 8000)}) + "\n")
+
+    win = rs.latest_run_window(events)
+    summary = rs.build_summary(
+        log_dir=str(logs), since=win["start_ts"], until=win["stop_ts"]
+    )
+    assert summary["window"]["scoped"] is True
+    r = summary["runner"]
+    assert r["run_status"] == "completed"
+    assert r["wall_clock_span_s"] == 3600        # only run 2's span
+    assert r["child_starts"] == 1
+    # only the run-2 trade survives the window filter
+    assert summary["trades"]["trades"] == 1
+
+
