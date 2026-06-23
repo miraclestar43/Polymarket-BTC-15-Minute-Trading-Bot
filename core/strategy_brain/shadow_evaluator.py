@@ -13,8 +13,12 @@ Shadow configs tested:
   5. markov_window = 15
   6. SHORT-only mode
   7. LONG-only mode
+  8-10. Relaxed Kelly variants
+  11-15. Regime-conditioned variants (block_long_macro_bear, short_bias_macro_bear,
+         side_specific_threshold, trend_guard, relaxed_markov_and_kelly)
 
 No simulated orders, no Telegram alerts, no paper_trades.json impact.
+All records are DRY-RUN / SHADOW only (dry_run=True, simulation=True).
 """
 import json
 import os
@@ -23,7 +27,9 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 
-# Shadow configuration variants
+# Built-in shadow configuration variants. These are diagnostic-only and never
+# affect live/baseline execution. They can be extended (not replaced) by a
+# dry-run-only config section via load_shadow_configs().
 SHADOW_CONFIGS = [
     {"name": "baseline", "description": "Current parameters"},
     {"name": "min_prob_082", "description": "min_prob=0.82", "min_prob": 0.82},
@@ -38,7 +44,60 @@ SHADOW_CONFIGS = [
     {"name": "shadow_no_kelly", "description": "No Kelly filter", "skip_kelly": True},
     {"name": "shadow_allow_kelly_minus_002", "description": "Allow Kelly down to -0.02", "kelly_min_raw": -0.02},
     {"name": "shadow_allow_kelly_minus_005", "description": "Allow Kelly down to -0.05", "kelly_min_raw": -0.05},
+    # --- Regime-conditioned shadow variants (diagnostic only) ---
+    # block_long_macro_bear: skip LONG entries when macro regime is bearish.
+    {"name": "block_long_macro_bear_shadow",
+     "description": "Block LONG when macro_regime=bear",
+     "block_long_macro_bear": True},
+    # short_bias_macro_bear: in macro_bear, allow only SHORT (block LONG); elsewhere unchanged.
+    {"name": "short_bias_macro_bear_shadow",
+     "description": "Prefer SHORT in macro_bear (block LONG in bear)",
+     "short_bias_macro_bear": True},
+    # side_specific_threshold: different min_prob for LONG vs SHORT.
+    {"name": "side_specific_threshold_shadow",
+     "description": "min_prob long=0.88 / short=0.84",
+     "min_prob_long": 0.88, "min_prob_short": 0.84},
+    # trend_guard: widen the neutral price band where no trade is taken
+    # (baseline trades only when price>0.60 long / <0.40 short; here require a
+    # stronger edge: price>0.65 long / <0.35 short).
+    {"name": "trend_guard_shadow",
+     "description": "Stricter trend band (0.35/0.65)",
+     "trend_long_min": 0.65, "trend_short_max": 0.35},
+    # relaxed_markov_and_kelly: relax BOTH gates together.
+    {"name": "relaxed_markov_and_kelly_shadow",
+     "description": "min_prob=0.82 AND allow Kelly down to -0.02",
+     "min_prob": 0.82, "kelly_min_raw": -0.02},
 ]
+
+# Optional dry-run-only config file. If present, its `extra_variants` list is
+# APPENDED to the built-ins (never replaces baseline behavior).
+_SHADOW_CONFIG_FILE = "shadow_experiments.yaml"
+
+
+def load_shadow_configs(config_path: str = _SHADOW_CONFIG_FILE) -> List[Dict[str, Any]]:
+    """
+    Return the active shadow variant list: built-in SHADOW_CONFIGS plus any
+    `extra_variants` defined in an optional dry-run-only YAML file. This never
+    alters baseline/live execution — it only adds diagnostic shadow variants.
+    """
+    configs = list(SHADOW_CONFIGS)
+    try:
+        p = Path(config_path)
+        if p.exists():
+            import yaml  # local import: optional dependency path
+            with open(p) as f:
+                data = yaml.safe_load(f) or {}
+            extra = data.get("extra_variants") or []
+            seen = {c["name"] for c in configs}
+            for v in extra:
+                if isinstance(v, dict) and v.get("name") and v["name"] not in seen:
+                    configs.append(v)
+                    seen.add(v["name"])
+    except Exception:
+        # Fail safe: never let a bad config file break shadow logging.
+        return list(SHADOW_CONFIGS)
+    return configs
+
 
 
 class ShadowEvaluator:
@@ -117,7 +176,7 @@ class ShadowEvaluator:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         log_path = self.log_dir / f"shadow_decisions_{today}.jsonl"
 
-        for config in SHADOW_CONFIGS:
+        for config in load_shadow_configs():
             record = self._evaluate_single(
                 config=config,
                 actual_event_type=actual_event_type,
@@ -184,14 +243,51 @@ class ShadowEvaluator:
         skip_kelly = config.get("skip_kelly", False)
         kelly_min_raw = config.get("kelly_min_raw", None)
 
+        # Regime-conditioned / side-specific / trend-guard variant params
+        block_long_macro_bear = config.get("block_long_macro_bear", False)
+        short_bias_macro_bear = config.get("short_bias_macro_bear", False)
+        min_prob_long = config.get("min_prob_long")
+        min_prob_short = config.get("min_prob_short")
+        trend_long_min = config.get("trend_long_min")
+        trend_short_max = config.get("trend_short_max")
+
+        # Derive macro regime from the combined regime string ("macro|intraday").
+        btc_regime_str = kwargs.get("btc_regime") or ""
+        macro_regime = btc_regime_str.split("|")[0].lower() if btc_regime_str else ""
+        is_macro_bear = "bear" in macro_regime
+
         # Direction filter
         actual_direction = kwargs["direction"]
         if name == "short_only" and actual_direction == "long":
             shadow_direction = "blocked_by_direction"
         elif name == "long_only" and actual_direction == "short":
             shadow_direction = "blocked_by_direction"
+        elif (block_long_macro_bear or short_bias_macro_bear) and \
+                actual_direction == "long" and is_macro_bear:
+            # Block LONG entries while macro regime is bearish.
+            shadow_direction = "blocked_by_direction"
         else:
             shadow_direction = actual_direction
+
+        # Side-specific min_prob (overrides the single min_prob when set).
+        if shadow_direction == "long" and min_prob_long is not None:
+            min_prob = min_prob_long
+        elif shadow_direction == "short" and min_prob_short is not None:
+            min_prob = min_prob_short
+
+        # Trend-guard: require a stronger price edge than baseline. If the entry
+        # price is inside the (wider) neutral band, treat as no-trade.
+        trend_guard_block = False
+        if shadow_direction != "blocked_by_direction" and \
+                (trend_long_min is not None or trend_short_max is not None):
+            entry = kwargs.get("entry_price")
+            if entry is not None:
+                if shadow_direction == "long" and trend_long_min is not None \
+                        and entry < trend_long_min:
+                    trend_guard_block = True
+                elif shadow_direction == "short" and trend_short_max is not None \
+                        and entry > trend_short_max:
+                    trend_guard_block = True
 
         # Markov check
         markov_passed_shadow = (
@@ -233,6 +329,7 @@ class ShadowEvaluator:
         # Final decision
         would_trade = (
             shadow_direction != "blocked_by_direction"
+            and not trend_guard_block
             and markov_passed_shadow
             and kelly_passed_shadow
             and liquidity_passed
@@ -244,6 +341,8 @@ class ShadowEvaluator:
         if not would_trade:
             if shadow_direction == "blocked_by_direction":
                 shadow_skip_reason = f"direction_blocked: {name}"
+            elif trend_guard_block:
+                shadow_skip_reason = f"trend_guard_block: entry={kwargs.get('entry_price')}"
             elif not markov_passed_shadow:
                 shadow_skip_reason = f"markov_below_threshold: p_stay={kwargs['p_stay']:.4f}<min_prob={min_prob:.4f}"
             elif not kelly_passed_shadow:
@@ -309,6 +408,8 @@ class ShadowEvaluator:
             "market_slug": kwargs.get("market_slug"),
             "market_question": kwargs.get("market_question"),
             "market_end_time": kwargs.get("market_end_time"),
+            "macro_regime": macro_regime or "unavailable",
+            "trend_guard_block": trend_guard_block,
             "would_trade": would_trade,
             "shadow_skip_reason": shadow_skip_reason,
             "dry_run": True,

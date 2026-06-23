@@ -235,3 +235,131 @@ def get_market_resolver() -> MarketResolver:
     if _resolver is None:
         _resolver = MarketResolver()
     return _resolver
+
+
+# ---------------------------------------------------------------------------
+# Outcome-source labels (used by shadow analysis to make coverage explicit).
+# ---------------------------------------------------------------------------
+OUTCOME_OFFICIAL = "official_resolution"
+OUTCOME_INFERRED = "inferred_from_market_data"
+OUTCOME_UNAVAILABLE = "unavailable"
+
+
+def normalize_outcome_source(resolution_status: str, resolution_source: Optional[str]) -> str:
+    """
+    Map a resolver result to a clearly-labeled outcome source.
+
+    - resolved (from Gamma API) -> official_resolution
+    - everything else            -> unavailable
+    BTC-price inference is applied separately via infer_outcome_from_btc().
+    """
+    if resolution_status == "resolved":
+        return OUTCOME_OFFICIAL
+    return OUTCOME_UNAVAILABLE
+
+
+def load_btc_price_history(log_dir: str = "logs") -> list:
+    """
+    Load BTC price history points {ts, price} sorted by ts.
+
+    Diagnostic only. Returns [] if the file is missing or unreadable.
+    """
+    path = Path(log_dir) / "btc_price_history.jsonl"
+    points: list = []
+    if not path.exists():
+        return points
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = r.get("ts")
+                price = r.get("price")
+                if ts is not None and price is not None:
+                    points.append({"ts": float(ts), "price": float(price)})
+    except Exception:
+        return []
+    points.sort(key=lambda p: p["ts"])
+    return points
+
+
+def _nearest_price(points: list, target_ts: float, max_gap_s: float) -> Optional[float]:
+    """Return the price of the point nearest to target_ts within max_gap_s, else None."""
+    if not points or target_ts is None:
+        return None
+    best = None
+    best_gap = None
+    for p in points:
+        gap = abs(p["ts"] - target_ts)
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best = p
+    if best is None or best_gap is None or best_gap > max_gap_s:
+        return None
+    return best["price"]
+
+
+def infer_outcome_from_btc(
+    start_ts: Optional[float],
+    end_ts: Optional[float],
+    price_points: list,
+    max_gap_s: float = 15 * 60,
+) -> Dict[str, Any]:
+    """
+    Infer a BTC 15-minute market outcome from BTC price at the window open vs
+    close. DIAGNOSTIC ONLY — never used for live trading.
+
+    Rule: BTC close > open  -> "UP"   (YES wins)
+          BTC close < open  -> "DOWN" (NO wins)
+          BTC close == open -> "FLAT" (treated as unavailable; no fake outcome)
+
+    Returns:
+      {
+        "outcome": "UP"|"DOWN"|None,
+        "outcome_source": "inferred_from_market_data"|"unavailable",
+        "open_price": float|None,
+        "close_price": float|None,
+        "reason": str,
+      }
+
+    Returns outcome_source="unavailable" (no fabricated P/L) whenever either
+    boundary price is missing within max_gap_s or the move is exactly flat.
+    """
+    open_price = _nearest_price(price_points, start_ts, max_gap_s) if start_ts is not None else None
+    close_price = _nearest_price(price_points, end_ts, max_gap_s) if end_ts is not None else None
+
+    if open_price is None or close_price is None:
+        return {
+            "outcome": None,
+            "outcome_source": OUTCOME_UNAVAILABLE,
+            "open_price": open_price,
+            "close_price": close_price,
+            "reason": "missing_boundary_price",
+        }
+
+    if close_price > open_price:
+        outcome = "UP"
+    elif close_price < open_price:
+        outcome = "DOWN"
+    else:
+        return {
+            "outcome": None,
+            "outcome_source": OUTCOME_UNAVAILABLE,
+            "open_price": open_price,
+            "close_price": close_price,
+            "reason": "flat_move_no_outcome",
+        }
+
+    return {
+        "outcome": outcome,
+        "outcome_source": OUTCOME_INFERRED,
+        "open_price": open_price,
+        "close_price": close_price,
+        "reason": "btc_open_vs_close",
+    }
+
