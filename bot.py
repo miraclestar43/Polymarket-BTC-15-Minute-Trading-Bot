@@ -74,6 +74,7 @@ from journal.trade_journal import get_journal
 from core.strategy_brain.shadow_evaluator import evaluate_shadow
 from core.strategy_brain.regime.aggregator import get_and_persist_regime
 from core.strategy_brain.market_resolver import get_market_resolver
+from core.diagnostics import runtime_diag as diag
 from notifications.telegram_notifier import send_telegram_message, is_configured as tg_is_configured
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
@@ -697,6 +698,16 @@ class IntegratedBTCStrategy(Strategy):
         Timer loop: checks every 10 seconds if it's time to switch markets.
         Also handles the case where we're waiting for a future market to open.
         """
+        # Register this long-lived loop and start an event-loop lag monitor so a
+        # stall (loop failing to wake on schedule) is captured with timing.
+        try:
+            diag.register_loop(asyncio.get_event_loop())
+            self._lag_monitor = diag.EventLoopLagMonitor(
+                interval=5.0, threshold_s=2.0, name="timer_loop")
+            asyncio.ensure_future(self._lag_monitor.run())
+        except Exception as e:  # noqa: BLE001 - diagnostics must never break the loop
+            logger.debug(f"Lag monitor not started: {e}")
+
         while True:
             self.watchdog.heartbeat("timer_loop")
             # --- auto-restart check ---
@@ -919,9 +930,11 @@ class IntegratedBTCStrategy(Strategy):
         try:
             from data_sources.news_social.adapter import NewsSocialDataSource
             news_source = NewsSocialDataSource()
-            await news_source.connect()
-            fg = await news_source.get_fear_greed_index()
-            await news_source.disconnect()
+            async with diag.atimed("fetch_fear_greed"):
+                await asyncio.wait_for(news_source.connect(), timeout=diag.NET_TIMEOUT_S)
+                fg = await asyncio.wait_for(
+                    news_source.get_fear_greed_index(), timeout=diag.NET_TIMEOUT_S)
+                await asyncio.wait_for(news_source.disconnect(), timeout=diag.NET_TIMEOUT_S)
             if fg and "value" in fg:
                 metadata["sentiment_score"] = float(fg["value"])
                 metadata["sentiment_classification"] = fg.get("classification", "")
@@ -938,9 +951,11 @@ class IntegratedBTCStrategy(Strategy):
         try:
             from data_sources.coinbase.adapter import CoinbaseDataSource
             coinbase = CoinbaseDataSource()
-            await coinbase.connect()
-            spot = await coinbase.get_current_price()
-            await coinbase.disconnect()
+            async with diag.atimed("fetch_coinbase_spot"):
+                await asyncio.wait_for(coinbase.connect(), timeout=diag.NET_TIMEOUT_S)
+                spot = await asyncio.wait_for(
+                    coinbase.get_current_price(), timeout=diag.NET_TIMEOUT_S)
+                await asyncio.wait_for(coinbase.disconnect(), timeout=diag.NET_TIMEOUT_S)
             if spot:
                 metadata["spot_price"] = float(spot)
                 logger.info(f"Coinbase spot price: ${float(spot):,.2f}")
@@ -982,7 +997,8 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- BTC regime diagnostics (does not affect trading) ---
         try:
-            btc_regime_data = get_and_persist_regime()
+            with diag.timed("btc_regime_fetch"):
+                btc_regime_data = get_and_persist_regime()
         except Exception:
             btc_regime_data = {
                 "btc_price": None, "btc_return_15m": None, "btc_return_1h": None,
@@ -1006,11 +1022,12 @@ class IntegratedBTCStrategy(Strategy):
                     market_end_time = instrument.info.get('endDate')
                     instrument_info = instrument.info
 
-            market_resolution = resolver.resolve(
-                market_id=str(self.instrument_id) if self.instrument_id else None,
-                slug=market_slug,
-                market_data=instrument_info,
-            )
+            with diag.timed("market_resolve"):
+                market_resolution = resolver.resolve(
+                    market_id=str(self.instrument_id) if self.instrument_id else None,
+                    slug=market_slug,
+                    market_data=instrument_info,
+                )
             # Add market identifiers to resolution result
             market_resolution["market_slug"] = market_slug
             market_resolution["market_question"] = market_question
@@ -2046,6 +2063,11 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
+
+    # Install on-demand stall diagnostics (SIGUSR1 native traceback, SIGUSR2
+    # rich JSON snapshot). Instrumentation only — never alters trading logic.
+    _diag_status = diag.install_diagnostics()
+    logger.info(f"Runtime diagnostics installed: {_diag_status}")
 
     # Load strategy configuration from YAML
     strategy_config = get_config(overrides={"dry_run": simulation})

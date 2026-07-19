@@ -29,6 +29,13 @@ SHADOW_DIR = "logs"
 STALE_THRESHOLD_SECONDS = 45 * 60  # 45 minutes
 WATCHDOG_CHECK_INTERVAL = 60  # Check every 60 seconds
 
+# Directory where the child writes on-demand stall diagnostics (see
+# core/diagnostics/runtime_diag.py). Before force-restarting a stalled child,
+# the watchdog signals it to dump native + rich diagnostics here so the stall
+# stack is captured while the process is still wedged.
+DIAG_DUMP_DIR = "logs/diagnostics"
+DIAG_CAPTURE_WAIT_SECONDS = 3.0
+
 # Structured lifecycle event log (append-only, source of truth for run summaries)
 RUNNER_EVENTS_FILE = "logs/runner_events.jsonl"
 
@@ -259,6 +266,54 @@ class RunnerWatchdog:
             pass
         return None
 
+    def _capture_child_diagnostics(self, child_pid: int) -> dict:
+        """
+        Signal the wedged child to dump diagnostics BEFORE we terminate it.
+
+        Sends SIGUSR1 (native faulthandler all-thread traceback) and SIGUSR2
+        (rich JSON snapshot), waits briefly for the files to be written, then
+        reports the newest diagnostic artifacts. Best-effort and fail-safe.
+        """
+        result = {"faulthandler_log": None, "rich_dump": None, "signalled": False}
+        dump_dir = project_root / DIAG_DUMP_DIR
+        # Record which rich dumps already exist so we can detect the new one.
+        before = set()
+        try:
+            before = {p.name for p in dump_dir.glob("stall_diag_*.json")}
+        except OSError:
+            pass
+
+        for signame in ("SIGUSR1", "SIGUSR2"):
+            sig = getattr(signal, signame, None)
+            if sig is None:
+                continue
+            try:
+                os.kill(child_pid, sig)
+                result["signalled"] = True
+            except ProcessLookupError:
+                print(f"[WATCHDOG] Child gone before diagnostics ({signame})")
+                return result
+            except Exception as e:  # noqa: BLE001
+                print(f"[WATCHDOG] Failed to send {signame}: {e}")
+
+        # Give the child a moment to write the dumps.
+        time.sleep(DIAG_CAPTURE_WAIT_SECONDS)
+
+        try:
+            fault_log = dump_dir / "faulthandler.log"
+            if fault_log.exists():
+                result["faulthandler_log"] = str(fault_log.relative_to(project_root))
+            new_dumps = sorted(
+                p for p in dump_dir.glob("stall_diag_*.json") if p.name not in before
+            )
+            if new_dumps:
+                result["rich_dump"] = str(new_dumps[-1].relative_to(project_root))
+        except OSError:
+            pass
+
+        print(f"[WATCHDOG] Captured child diagnostics: {result}")
+        return result
+
     def _restart_child(self, child_pid: int, reason: str):
         """Kill the stuck child process."""
         now = time.time()
@@ -286,6 +341,11 @@ class RunnerWatchdog:
         print(f"[WATCHDOG] === END DIAGNOSTICS ===")
 
         self._last_restart_time = now
+        # Before terminating, ask the wedged child to dump its diagnostics
+        # (native all-thread traceback + rich JSON snapshot) so the stall stack
+        # is captured while the process is still stuck.
+        diag_paths = self._capture_child_diagnostics(child_pid)
+
         # Attribute this child's upcoming exit to the watchdog (by PID).
         self.last_restart = {"pid": child_pid, "ts": now, "reason": reason}
         log_runner_event(
@@ -295,6 +355,7 @@ class RunnerWatchdog:
             heartbeat_age_s=round(heartbeat_age, 1) if heartbeat_age is not None else None,
             journal_age_s=round(journal_age, 1) if journal_age is not None else None,
             shadow_age_s=round(shadow_age, 1) if shadow_age is not None else None,
+            diagnostics=diag_paths,
         )
 
         # Try graceful termination first
