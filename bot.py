@@ -73,6 +73,7 @@ from core.strategy_brain.signal_processors.markov_processor import get_markov_fi
 from journal.trade_journal import get_journal
 from core.strategy_brain.shadow_evaluator import evaluate_shadow
 from core.strategy_brain.regime.aggregator import get_and_persist_regime
+from core.market_data.dual_book import DualBookStore
 from core.strategy_brain.market_resolver import get_market_resolver
 from core.diagnostics import runtime_diag as diag
 from notifications.telegram_notifier import send_telegram_message, is_configured as tg_is_configured
@@ -245,6 +246,22 @@ class IntegratedBTCStrategy(Strategy):
 
         # YES token id for the current market (set in _load_all_btc_instruments)
         self._yes_token_id: Optional[str] = None
+        self._no_token_id: Optional[str] = None
+        self._no_instrument_id = None
+
+        # Dual-token order-book store (DIAGNOSTIC ONLY). Maintains SEPARATE books
+        # for the YES/Up and NO/Down tokens keyed by token id so a SHORT/BUY-NO
+        # decision can record the contemporaneous NO ask instead of reusing the
+        # YES midpoint. Thresholds come from strategy.yaml (market_data:).
+        md_cfg = self.strategy_config.get("market_data", {}) or {}
+        self._dual_books = DualBookStore(
+            freshness_seconds=float(md_cfg.get("quote_freshness_seconds", 60.0)),
+            skew_warn_seconds=float(md_cfg.get("cross_book_skew_warn_seconds", 5.0)),
+            max_spread_warn=float(md_cfg.get("max_spread_warn", 0.10)),
+            sum_bid_max=float(md_cfg.get("sum_bid_max", 1.05)),
+            sum_ask_min=float(md_cfg.get("sum_ask_min", 0.95)),
+        )
+        self._paper_fixed_risk = float(md_cfg.get("paper_fixed_risk", 1.0))
 
         # Phase 4: Signal Processors
         self.spike_detector = SpikeDetectionProcessor(
@@ -602,6 +619,7 @@ class IntegratedBTCStrategy(Strategy):
                 # =========================================================================
                 self.subscribe_quote_ticks(self.instrument_id)
                 logger.info(f"  ✓ SUBSCRIBED to current market")
+                self._activate_dual_books()
                 break
         
         if self.current_instrument_index == -1 and btc_instruments:
@@ -629,6 +647,7 @@ class IntegratedBTCStrategy(Strategy):
             # Subscribe so we get ticks when it opens
             self.subscribe_quote_ticks(self.instrument_id)
             logger.info(f"  ✓ SUBSCRIBED to future market")
+            self._activate_dual_books()
             # Block trading until the market actually opens (timer loop sets _market_open flag)
             self._waiting_for_market_open = True
             
@@ -678,6 +697,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"  Trade timer reset — will trade on next tick")
         
         self.subscribe_quote_ticks(self.instrument_id)
+        self._activate_dual_books()
         return True
 
     # ------------------------------------------------------------------
@@ -752,6 +772,14 @@ class IntegratedBTCStrategy(Strategy):
         """Handle quote tick - TRADE when market opens and at each 15-min boundary"""
         try:
             self.watchdog.heartbeat("quote_tick")
+            # Route the NO/Down book into the dual-book store (diagnostic capture
+            # only) and stop — NO ticks never drive the trade decision.
+            if (self._no_instrument_id is not None
+                    and tick.instrument_id == self._no_instrument_id):
+                self._record_token_tick(
+                    self._no_token_id, tick,
+                    datetime.now(timezone.utc).timestamp())
+                return
             # Only process ticks from current instrument
             if self.instrument_id is None or tick.instrument_id != self.instrument_id:
                 return
@@ -777,6 +805,8 @@ class IntegratedBTCStrategy(Strategy):
             
             # Store latest bid/ask for liquidity check before order placement
             self._last_bid_ask = (bid_decimal, ask_decimal)
+            # Also record the YES/Up top-of-book into the dual-book store.
+            self._record_token_tick(self._yes_token_id, tick, now.timestamp())
 
             # Tick buffer for TickVelocityProcessor (rolling 90s window)
             self._tick_buffer.append({'ts': now, 'price': mid_price})
@@ -886,11 +916,12 @@ class IntegratedBTCStrategy(Strategy):
         have at decision time; it makes NO network call, adds no latency, and
         does NOT influence any decision.
 
-        We are subscribed to the YES/Up token, so we can record its live
-        bid/ask/mid and token id. The NO/Down book is not subscribed, so the
-        NO ask is not captured; the shadow evaluator marks short economics
-        ``economic_pnl_unavailable`` rather than deriving a NO cost. The YES
-        mid is never backfilled from a closed market's CLOB state.
+        We subscribe to BOTH outcome-token books (YES/Up and NO/Down) and route
+        each into a per-token dual-book store. For a SHORT/BUY-NO decision the
+        shadow evaluator can therefore use the contemporaneous NO ask; when the
+        NO book is missing, stale, crossed, or invalid the record is marked
+        ``economic_pnl_unavailable`` rather than deriving a NO cost from the YES
+        book. The YES mid is never backfilled from a closed market's CLOB state.
         """
         bid = ask = None
         try:
@@ -917,9 +948,11 @@ class IntegratedBTCStrategy(Strategy):
             mid = str(self.instrument_id)
             if mid.startswith("0x") and "-" in mid:
                 condition_id = mid.split("-", 1)[0]
-        return {
+        # YES-only fallback (used when the dual-book store is not active, e.g.
+        # in unit tests): never fabricates a NO-token ask.
+        quote = {
             "yes_token_id": self._yes_token_id,
-            "no_token_id": None,  # NO/Down book not subscribed
+            "no_token_id": None,  # NO/Down book not available in fallback
             "condition_id": condition_id,
             "market_start_time": start_epoch,
             "market_end_time": end_epoch,
@@ -930,6 +963,82 @@ class IntegratedBTCStrategy(Strategy):
             "quote_timestamp": datetime.now(timezone.utc).isoformat(),
             "quote_source": "yes_book_ws",
         }
+
+        # Overlay the contemporaneous dual-book snapshot when the store is
+        # active for THIS market. Executable NO/YES asks are only present when
+        # the corresponding token book is OK (fresh, uncrossed, in-range).
+        store = getattr(self, "_dual_books", None)
+        if (store is not None and self._yes_token_id is not None
+                and store.yes_token_id == self._yes_token_id):
+            try:
+                snap = store.snapshot_quote(datetime.now(timezone.utc).timestamp())
+                # Slug-derived identity/timing stay authoritative.
+                snap["market_start_time"] = start_epoch
+                snap["market_end_time"] = end_epoch
+                if not snap.get("condition_id"):
+                    snap["condition_id"] = condition_id
+                # Keep quote_timestamp as an ISO capture time for reader
+                # compatibility; per-token epoch timestamps/ages are retained
+                # separately for skew/freshness math.
+                snap["quote_timestamp"] = datetime.now(timezone.utc).isoformat()
+                snap["paper_fixed_risk"] = self._paper_fixed_risk
+                quote = snap
+            except Exception as e:  # noqa: BLE001 - capture must never break trading
+                logger.debug(f"Dual-book snapshot skipped: {e}")
+        return quote
+
+    @staticmethod
+    def _token_id_from_instrument(instrument_id) -> Optional[str]:
+        """Extract the bare CLOB token id from a Nautilus instrument id
+        (``0x{condition}-{token}.POLYMARKET``)."""
+        if instrument_id is None:
+            return None
+        raw = str(instrument_id)
+        without = raw.split('.')[0] if '.' in raw else raw
+        return without.split('-')[-1] if '-' in without else without
+
+    def _activate_dual_books(self):
+        """
+        (Re)point the dual-book store at the current market and subscribe to
+        BOTH outcome-token books. DIAGNOSTIC capture only — it records quotes,
+        it does not change any signal, side selection, or sizing.
+        """
+        try:
+            self._no_token_id = self._token_id_from_instrument(self._no_instrument_id)
+            cond = None
+            mid = str(self.instrument_id) if self.instrument_id else ""
+            if mid.startswith("0x") and "-" in mid:
+                cond = mid.split("-", 1)[0]
+            self._dual_books.set_market(
+                condition_id=cond, yes_token_id=self._yes_token_id,
+                no_token_id=self._no_token_id, market_id=mid or None)
+            if self._no_instrument_id is not None:
+                self.subscribe_quote_ticks(self._no_instrument_id)
+                logger.info("  ✓ SUBSCRIBED to NO/Down book (dual-book capture)")
+            else:
+                logger.info("  ⚠ NO/Down instrument unavailable — NO book not captured")
+        except Exception as e:  # noqa: BLE001 - capture must never break trading
+            logger.debug(f"Dual-book activation skipped: {e}")
+
+    def _record_token_tick(self, token_id, tick, ts):
+        """Store a top-of-book quote tick for a token into the dual-book store."""
+        try:
+            bid = tick.bid_price
+            ask = tick.ask_price
+            if bid is None or ask is None:
+                return
+            bsz = getattr(tick, "bid_size", None)
+            asz = getattr(tick, "ask_size", None)
+            self._dual_books.apply_top_of_book(
+                token_id,
+                float(bid.as_decimal()),
+                float(bsz.as_decimal()) if bsz is not None else None,
+                float(ask.as_decimal()),
+                float(asz.as_decimal()) if asz is not None else None,
+                ts, source="quote_tick")
+        except Exception:
+            pass
+
 
     def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
