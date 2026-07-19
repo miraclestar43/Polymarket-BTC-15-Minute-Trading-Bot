@@ -83,6 +83,57 @@ def test_parse_non_dict_payload():
     assert r["parse_error"] == "payload_not_object"
 
 
+def test_parse_captures_both_token_ids_and_labels():
+    r = ores.parse_clob_market(_clob_payload(winner_outcome="Up"), _CID)
+    assert r["winning_token_id"] == "t_up"
+    assert r["losing_token_id"] == "t_dn"          # both sides identified
+    assert r["winning_price"] == 1
+    assert r["winning_outcome_raw"] == "Up"
+    assert r["parser_version"] == ores.PARSER_VERSION
+    assert isinstance(r["tokens_summary"], list) and len(r["tokens_summary"]) == 2
+
+
+def test_parse_rejects_ambiguous_multiple_winners():
+    payload = _clob_payload()
+    for t in payload["tokens"]:          # both flagged winner
+        t["winner"] = True
+        t["price"] = 1
+    r = ores.parse_clob_market(payload, _CID)
+    assert r["status"] == ores.STATUS_MALFORMED
+    assert r["parse_error"] == "closed_multiple_winners"
+    assert r["resolved_outcome"] is None
+
+
+def test_parse_price_one_alone_without_outcome_is_rejected():
+    # A token at price==1 but with an unrecognizable outcome label must not be
+    # trusted on price alone (winner/outcome identity is ambiguous).
+    payload = {
+        "condition_id": _CID, "closed": True,
+        "tokens": [
+            {"token_id": "t_x", "outcome": "Maybe", "price": 1, "winner": None},
+            {"token_id": "t_y", "outcome": "Other", "price": 0, "winner": None},
+        ],
+    }
+    r = ores.parse_clob_market(payload, _CID)
+    assert r["status"] == ores.STATUS_MALFORMED
+    assert r["resolved_outcome"] is None
+    assert str(r["parse_error"]).startswith("unrecognized_outcome")
+
+
+def test_parse_price_one_fallback_when_no_winner_flag():
+    # No winner flag but exactly one token at price==1 with a valid label -> ok.
+    payload = {
+        "condition_id": _CID, "closed": True,
+        "tokens": [
+            {"token_id": "t_up", "outcome": "Up", "price": 1, "winner": None},
+            {"token_id": "t_dn", "outcome": "Down", "price": 0, "winner": None},
+        ],
+    }
+    r = ores.parse_clob_market(payload, _CID)
+    assert r["status"] == ores.STATUS_RESOLVED
+    assert r["resolved_outcome"] == "UP" and r["winning_token_id"] == "t_up"
+
+
 # --------------------------------------------------------------------------
 # fetch_official via fixture opener (no network)
 # --------------------------------------------------------------------------

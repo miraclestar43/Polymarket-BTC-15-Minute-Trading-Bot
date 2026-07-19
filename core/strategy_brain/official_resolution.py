@@ -42,6 +42,9 @@ from core.strategy_brain.market_resolver import (
 CLOB_BASE = "https://clob.polymarket.com"
 OFFICIAL_STORE_FILE = "official_resolutions.jsonl"
 
+# Bumped whenever the parse logic changes so stored records are traceable.
+PARSER_VERSION = "clob-resolution-2"
+
 # Parsing / retrieval status taxonomy (kept explicit for auditing).
 STATUS_RESOLVED = "resolved"
 STATUS_PENDING = "pending"
@@ -88,6 +91,11 @@ def parse_clob_market(
         "question": None,
         "market_slug": None,
         "winning_token_id": None,
+        "losing_token_id": None,
+        "winning_price": None,
+        "winning_outcome_raw": None,
+        "tokens_summary": None,
+        "parser_version": PARSER_VERSION,
         "parse_error": None,
     }
 
@@ -113,11 +121,29 @@ def parse_clob_market(
         out["parse_error"] = "missing_tokens"
         return out
 
-    closed = bool(data.get("closed", False))
-    winners = [
-        t for t in tokens
-        if isinstance(t, dict) and (t.get("winner") is True or t.get("price") in (1, 1.0))
+    # Bounded, auditable summary of every token (identity of both sides).
+    tokens_summary = [
+        {
+            "token_id": t.get("token_id"),
+            "outcome": t.get("outcome"),
+            "winner": t.get("winner"),
+            "price": t.get("price"),
+        }
+        for t in tokens if isinstance(t, dict)
     ]
+    out["tokens_summary"] = tokens_summary
+
+    closed = bool(data.get("closed", False))
+
+    # Prefer the explicit winner flag. Only fall back to price==1 when NO token
+    # carries a winner flag, and even then require an unambiguous single match
+    # with a recognizable outcome (price==1 alone is not sufficient identity).
+    flagged = [t for t in tokens if isinstance(t, dict) and t.get("winner") is True]
+    priced = [t for t in tokens if isinstance(t, dict) and t.get("price") in (1, 1.0)]
+    if flagged:
+        winners = flagged
+    else:
+        winners = priced
 
     if not closed:
         out["status"] = STATUS_PENDING
@@ -131,15 +157,25 @@ def parse_clob_market(
             "closed_no_winner" if not winners else "closed_multiple_winners")
         return out
 
-    outcome = _norm_outcome(winners[0].get("outcome"))
+    win_tok = winners[0]
+    outcome = _norm_outcome(win_tok.get("outcome"))
     if outcome is None:
-        out["parse_error"] = f"unrecognized_outcome:{winners[0].get('outcome')!r}"
+        # A winner with no recognizable Up/Down/Yes/No label is ambiguous
+        # identity — reject rather than trust a bare price==1.
+        out["parse_error"] = f"unrecognized_outcome:{win_tok.get('outcome')!r}"
         return out
+
+    win_token_id = win_tok.get("token_id")
+    losers = [t.get("token_id") for t in tokens
+              if isinstance(t, dict) and t.get("token_id") != win_token_id]
 
     out["status"] = STATUS_RESOLVED
     out["resolved_outcome"] = outcome
     out["resolution_source"] = OUTCOME_OFFICIAL
-    out["winning_token_id"] = winners[0].get("token_id")
+    out["winning_token_id"] = win_token_id
+    out["losing_token_id"] = losers[0] if len(losers) == 1 else None
+    out["winning_price"] = win_tok.get("price")
+    out["winning_outcome_raw"] = win_tok.get("outcome")
     out["parse_error"] = None
     return out
 
