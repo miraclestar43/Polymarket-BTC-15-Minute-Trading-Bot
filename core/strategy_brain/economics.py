@@ -7,14 +7,26 @@ comparisons are economically valid and resistant to low-price payout artifacts.
 --------------------------------------------------------------------------
 Binary payout model (a YES/NO or UP/DOWN share settles at $1 or $0)
 --------------------------------------------------------------------------
-You buy `shares` of the token for the chosen side at price ``entry`` (the
-recorded ``entry_price`` is the price of the token actually taken for that
-side, so the math is symmetric for LONG/YES and SHORT/NO — only the winning
-outcome differs):
+CRITICAL — YES price vs. selected-token executable price.
+The recorded ``entry_price`` in the historical shadow records is the
+YES-token (Up) MIDPOINT for BOTH long and short decisions (proven: ``odds_b``
+equals (1-e)/e for longs and e/(1-e) for shorts across every record). The
+price of the token ACTUALLY taken is therefore:
 
-    cost = shares * entry            # paid up-front == capital at risk
-    if the side wins:  payout = shares * $1  -> net = shares * (1 - entry)
-    if the side loses: payout = 0            -> net = -shares * entry
+    LONG / BUY YES : exec = yes_price
+    SHORT / BUY NO : exec = 1 - yes_price
+
+A prior version used ``entry_price`` (the YES price) directly as the NO cost
+for shorts, which fabricated huge payouts at low YES prices. ``settle_trade``
+now derives the selected-token exec price from the side, so shorts are priced
+against the NO token. Pass ``selected_exec_price`` to override when a record
+stores the executable price of the taken token directly.
+
+You buy `shares` of the taken token at ``exec`` (the selected-token price):
+
+    cost = shares * exec             # paid up-front == capital at risk
+    if the side wins:  payout = shares * $1  -> net = shares * (1 - exec)
+    if the side loses: payout = 0            -> net = -shares * exec
 
 Because a binary contract can only fall to $0, the up-front cost IS the
 maximum loss. So "capital at risk", "notional cost", and "maximum loss"
@@ -26,20 +38,20 @@ Sizing modes
 --------------------------------------------------------------------------
 RECORDED_STAKE  (historical semantic):
     stake (== max loss) is fixed (default $5, the value the settlement
-    pipeline recorded).  shares = stake / entry.
+    pipeline recorded).  shares = stake / exec.
     Depends on historical sizing semantics; label results accordingly.
 
 FIXED_RISK  (recommended fair comparison):
     max loss R is fixed (default $1) for EVERY trade regardless of side or
-    price.  shares = R / entry.  This makes total capital at risk = R * N,
+    price.  shares = R / exec.  This makes total capital at risk = R * N,
     so returns are directly comparable across variants with different trade
     counts and price mixes.
-        LONG/YES : shares = R / entry ; win net = R*(1-entry)/entry ; loss = -R
-        SHORT/NO : shares = R / entry ; win net = R*(1-entry)/entry ; loss = -R
-    (entry is the price of the taken side's token in both cases.)
+        LONG/YES : exec = yes_price   ; win net = R*(1-exec)/exec ; loss = -R
+        SHORT/NO : exec = 1-yes_price ; win net = R*(1-exec)/exec ; loss = -R
+    (exec is the price of the taken side's token, derived by side.)
 
 EQUAL_SHARES  (fixed FACE notional; optional, NOT risk-normalized):
-    shares = N is fixed (equal payout exposure).  Capital at risk = N*entry
+    shares = N is fixed (equal payout exposure).  Capital at risk = N*exec
     VARIES with price, so risk is UNEQUAL across trades. Provided only to show
     equal-payout-exposure accounting; never rank strategies by it.
 
@@ -99,6 +111,28 @@ def validate_price(entry: Any) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def selected_token_price(side: str, yes_price: Any) -> Optional[float]:
+    """
+    Executable price of the token ACTUALLY taken for ``side`` given the YES
+    (Up) token price. LONG/YES buys the YES token (exec = yes_price); SHORT/NO
+    buys the NO (Down) token (exec = 1 - yes_price). Returns None when the YES
+    price is not a valid probability. This is the single guard that prevents a
+    YES price from being used as a NO cost.
+    """
+    try:
+        y = float(yes_price)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < y < 1.0):
+        return None
+    s = (side or "").strip().lower()
+    if s in ("long", "buy yes", "yes", "up"):
+        return y
+    if s in ("short", "buy no", "no", "down"):
+        return 1.0 - y
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Single-trade settlement under a chosen sizing mode
 # ---------------------------------------------------------------------------
@@ -111,22 +145,28 @@ def settle_trade(
     risk: float = DEFAULT_FIXED_RISK,
     stake: float = DEFAULT_RECORDED_STAKE,
     shares: float = DEFAULT_EQUAL_SHARES,
+    selected_exec_price: Any = None,
 ) -> Dict[str, Any]:
     """
     Settle ONE hypothetical binary trade. Returns a fully-labelled dict:
 
-        valid, reason, win, entry_price, num_shares,
+        valid, reason, win, yes_price, entry_price, num_shares,
         capital_at_risk, max_loss, gross_payout, net_pnl, return_on_risk
+
+    ``entry`` is the YES-token price (market P(Up)); the executable price of the
+    TAKEN token is derived by side (YES for long, 1-YES for short) unless
+    ``selected_exec_price`` is supplied. ``entry_price`` in the returned dict is
+    the selected-token exec price actually used for the payout math.
 
     ``valid`` is False (with a ``reason``) for impossible prices, undecidable
     outcomes, or zero/undefined risk — such records are explicit, never counted
     as silent zeros.
     """
     base = {
-        "valid": False, "reason": None, "win": None, "entry_price": None,
-        "num_shares": None, "capital_at_risk": None, "max_loss": None,
-        "gross_payout": None, "net_pnl": None, "return_on_risk": None,
-        "sizing_mode": sizing_mode,
+        "valid": False, "reason": None, "win": None, "yes_price": None,
+        "entry_price": None, "num_shares": None, "capital_at_risk": None,
+        "max_loss": None, "gross_payout": None, "net_pnl": None,
+        "return_on_risk": None, "sizing_mode": sizing_mode,
     }
 
     win = outcome_wins_side(outcome, side)
@@ -134,12 +174,27 @@ def settle_trade(
         base["reason"] = "undecidable_outcome"
         return base
 
-    ok, why = validate_price(entry)
-    if not ok:
-        base["reason"] = why
-        base["win"] = win
-        return base
-    p = float(entry)
+    if selected_exec_price is not None:
+        yes_p = None
+        ok, why = validate_price(selected_exec_price)
+        if not ok:
+            base["reason"] = why
+            base["win"] = win
+            return base
+        p = float(selected_exec_price)
+    else:
+        ok, why = validate_price(entry)
+        if not ok:
+            base["reason"] = why
+            base["win"] = win
+            return base
+        yes_p = float(entry)
+        exec_p = selected_token_price(side, yes_p)
+        if exec_p is None:
+            base["reason"] = "unknown_side_for_exec_price"
+            base["win"] = win
+            return base
+        p = exec_p
 
     if sizing_mode == RECORDED_STAKE:
         if stake <= 0:
@@ -170,6 +225,7 @@ def settle_trade(
     base.update({
         "valid": True,
         "win": win,
+        "yes_price": yes_p,
         "entry_price": p,
         "num_shares": round(n_shares, 8),
         "capital_at_risk": round(capital_at_risk, 8),

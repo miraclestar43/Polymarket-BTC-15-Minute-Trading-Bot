@@ -222,10 +222,14 @@ def resolve_candidate(
 
     pnl = None
     if win is not None and entry and 0.0 < entry < 1.0:
-        if win:
-            pnl = (1.0 - entry) * _POSITION_SIZE / entry
-        else:
-            pnl = -_POSITION_SIZE
+        # entry is the YES price; price the token actually taken (YES for a
+        # long, NO=1-YES for a short) so a YES price is never used as NO cost.
+        exec_p = entry if side == "long" else (1.0 - entry) if side == "short" else None
+        if exec_p is not None and 0.0 < exec_p < 1.0:
+            if win:
+                pnl = (1.0 - exec_p) * _POSITION_SIZE / exec_p
+            else:
+                pnl = -_POSITION_SIZE
 
     return {
         "shadow_side": side,

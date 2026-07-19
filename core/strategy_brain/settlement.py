@@ -20,13 +20,15 @@ diagnostic and NEVER places, signs, or submits orders):
   * Look-ahead prevention for inferred outcomes (explicit tolerance, reject
     ambiguous single-point windows).
 
-The P/L convention is intentionally identical to the pre-existing
-analyze_strategy_experiments.resolve_candidate() convention so historical
-analysis stays comparable:
+The P/L convention prices the token ACTUALLY taken for the side (YES for a
+long, NO for a short). ``entry_price`` is the YES-token (Up) price; the
+executable price is derived by side so a YES price is never used as a NO cost:
 
+    exec  = entry_price        (long / BUY YES)
+    exec  = 1 - entry_price    (short / BUY NO)
     size (== stake, in USD) is the maximum loss.
-    shares  = stake / entry_price
-    win  -> settlement value = shares * $1  => pnl = stake * (1 - entry) / entry
+    shares  = stake / exec
+    win  -> settlement value = shares * $1  => pnl = stake * (1 - exec) / exec
     loss -> settlement value = shares * $0  => pnl = -stake
 
 No fees are modelled by default (fee=0.0); a fee hook is provided so callers
@@ -312,28 +314,54 @@ def outcome_wins_side(outcome: Optional[str], side: str) -> Optional[bool]:
     return None
 
 
+def selected_token_exec_price(side: str, yes_price: float) -> Optional[float]:
+    """
+    Executable price of the token actually taken for ``side`` given the YES
+    (Up) price. LONG buys YES (exec = yes_price); SHORT buys NO (exec =
+    1 - yes_price). This prevents a YES price from being used as a NO cost.
+    """
+    if not (0.0 < float(yes_price) < 1.0):
+        return None
+    if side == "long":
+        return float(yes_price)
+    if side == "short":
+        return 1.0 - float(yes_price)
+    return None
+
+
 def compute_pnl(
     side: str,
     entry_price: Optional[float],
     outcome: Optional[str],
     stake: float = DEFAULT_STAKE,
     fee: float = 0.0,
+    selected_exec_price: Optional[float] = None,
 ) -> Tuple[Optional[bool], Optional[float]]:
     """
     Binary payout P/L. Returns (win, net_pnl).
 
-    shares = stake / entry
-    win  -> gross = stake*(1-entry)/entry ; loss -> gross = -stake
+    ``entry_price`` is the YES-token (Up) price; the executable price of the
+    TAKEN token is derived by side (YES for long, 1-YES for short) unless
+    ``selected_exec_price`` is supplied. This is the fix for the prior bug that
+    used the YES price directly as the NO cost for shorts.
+
+    shares = stake / exec
+    win  -> gross = stake*(1-exec)/exec ; loss -> gross = -stake
     net  = gross - fee
     Returns (None, None) when the side/entry/outcome cannot settle.
     """
     win = outcome_wins_side(outcome, side)
     if win is None:
         return None, None
-    if entry_price is None or not (0.0 < float(entry_price) < 1.0):
+    if selected_exec_price is not None:
+        exec_p = float(selected_exec_price)
+    else:
+        if entry_price is None or not (0.0 < float(entry_price) < 1.0):
+            return win, None
+        exec_p = selected_token_exec_price(side, float(entry_price))
+    if exec_p is None or not (0.0 < exec_p < 1.0):
         return win, None
-    entry = float(entry_price)
-    gross = (stake * (1.0 - entry) / entry) if win else -stake
+    gross = (stake * (1.0 - exec_p) / exec_p) if win else -stake
     return win, round(gross - fee, 6)
 
 

@@ -17,6 +17,52 @@ from core.strategy_brain import economics as econ
 
 
 # --------------------------------------------------------------------------
+# Selected-token exec price mapping (the YES-as-NO regression guard)
+# --------------------------------------------------------------------------
+def test_selected_token_price_long_uses_yes():
+    # A long BUYS the YES token: exec price == the YES price.
+    assert econ.selected_token_price("long", 0.30) == 0.30
+
+
+def test_selected_token_price_short_uses_no_not_yes():
+    # A short BUYS the NO token: exec price == 1 - YES, never the YES price.
+    assert abs(econ.selected_token_price("short", 0.30) - 0.70) < 1e-12
+    assert econ.selected_token_price("short", 0.02) == 0.98  # NOT 0.02
+
+
+def test_short_settle_prices_no_token():
+    # YES=0.02 short win: NO cost 0.98, ~+2% on risk, NOT a ~49x payout.
+    r = econ.settle_trade("short", 0.02, "DOWN", sizing_mode=econ.FIXED_RISK, risk=1.0)
+    assert r["valid"] and r["win"] is True
+    assert r["yes_price"] == 0.02
+    assert r["entry_price"] == 0.98              # selected-token exec price
+    assert r["net_pnl"] < 0.05                   # nowhere near buggy ~49
+    assert abs(r["net_pnl"] - (1 - 0.98) / 0.98) < 1e-6
+
+
+def test_long_settle_prices_yes_token():
+    r = econ.settle_trade("long", 0.02, "UP", sizing_mode=econ.FIXED_RISK, risk=1.0)
+    assert r["valid"] and r["win"] is True
+    assert r["entry_price"] == 0.02             # long uses YES price directly
+    assert abs(r["net_pnl"] - (1 - 0.02) / 0.02) < 1e-4  # ~49x is real for a long
+
+
+def test_explicit_selected_exec_price_overrides_derivation():
+    # When a record stores the taken token's executable price, use it directly.
+    r = econ.settle_trade("short", 0.02, "DOWN", sizing_mode=econ.FIXED_RISK,
+                          risk=1.0, selected_exec_price=0.97)
+    assert r["valid"] and r["entry_price"] == 0.97
+
+
+def test_model_probability_is_not_an_entry_price():
+    # A model probability must never be fed as an entry price. settle_trade only
+    # accepts a price via ``entry``/``selected_exec_price``; there is no field
+    # by which p_model can silently become the cost. A price >= 1 is rejected.
+    ok, reason = econ.validate_price(1.0)
+    assert not ok and reason == "price_ge_1"
+
+
+# --------------------------------------------------------------------------
 # Fixed-risk single-trade settlement (LONG / SHORT)
 # --------------------------------------------------------------------------
 def test_fixed_risk_long_win():
@@ -162,16 +208,17 @@ def test_safe_profit_factor_with_losses():
 
 def test_aggregate_reports_normalized_metrics():
     trades = [
-        _mk("long", 0.5, "UP", 1),      # win +1
+        _mk("long", 0.5, "UP", 1),      # win: exec 0.5 -> +1
         _mk("long", 0.5, "DOWN", 2),    # loss -1
-        _mk("short", 0.25, "DOWN", 3),  # win +3
+        _mk("short", 0.25, "DOWN", 3),  # win: NO exec 0.75 -> +0.3333
     ]
     agg = econ.aggregate(trades, sizing_mode=econ.FIXED_RISK, risk=1.0)
     assert agg["resolved_trades"] == 3
     assert agg["wins"] == 2 and agg["losses"] == 1
     assert agg["total_capital_at_risk"] == 3.0
-    assert agg["net_pnl"] == 3.0                     # 1 - 1 + 3
-    assert agg["return_on_capital_at_risk_pct"] == 100.0
+    # short is priced against the NO token (1-0.25=0.75), not the YES price.
+    assert abs(agg["net_pnl"] - (1.0 - 1.0 + (1 - 0.75) / 0.75)) < 1e-4
+    assert abs(agg["net_pnl"] - 0.333333) < 1e-4
     assert "concentration" in agg and "entry_price_distribution" in agg
 
 

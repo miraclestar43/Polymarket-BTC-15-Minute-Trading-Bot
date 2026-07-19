@@ -187,12 +187,30 @@ def test_long_pnl_win_and_loss():
 
 
 def test_short_pnl_win_and_loss():
+    # entry_price is the YES price. A short BUYS the NO token, whose executable
+    # price is 1 - YES = 0.75, so the win pays (1-0.75)/0.75 * 5 = 1.6667 (NOT
+    # the buggy 15.0 that used the YES price 0.25 as the NO cost).
     win, pnl = st.compute_pnl("short", 0.25, "DOWN", stake=5.0)
     assert win is True
-    assert abs(pnl - 15.0) < 1e-9  # (1-0.25)/0.25 * 5 = 15
+    assert abs(pnl - (0.75 / 0.75 * 0.0 + (1 - 0.75) / 0.75 * 5.0)) < 1e-6
+    assert abs(pnl - 1.666667) < 1e-5
     win, pnl = st.compute_pnl("short", 0.25, "UP", stake=5.0)
     assert win is False
     assert pnl == -5.0
+
+
+def test_short_prices_no_token_never_yes():
+    # A short at YES=0.02 must be priced against the NO token (cost 0.98,
+    # ~+2% on a win), NOT the YES price 0.02 (which would fake a ~49x payout).
+    win, pnl = st.compute_pnl("short", 0.02, "DOWN", stake=5.0)
+    assert win is True
+    # NO exec = 0.98 -> gross = 5*(1-0.98)/0.98 ~= 0.102
+    assert abs(pnl - (5.0 * (1 - 0.98) / 0.98)) < 1e-6
+    assert pnl < 0.2  # nowhere near the buggy ~245
+    # explicit override still honored when the executable price is known
+    win2, pnl2 = st.compute_pnl("short", 0.02, "DOWN", stake=5.0,
+                                selected_exec_price=0.98)
+    assert abs(pnl - pnl2) < 1e-9
 
 
 def test_entry_price_near_zero_and_one():
