@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from core.strategy_brain import paper_execution
+
 
 # Built-in shadow configuration variants. These are diagnostic-only and never
 # affect live/baseline execution. They can be extended (not replaced) by a
@@ -85,17 +87,19 @@ def _forward_schema_fields(
     shadow_direction: str,
     yes_midpoint: Optional[float],
     quote: Optional[Dict[str, Any]],
+    decision_timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build the v2 self-describing executable-quote block for one record.
 
     Keeps the concepts strictly separate: YES-token quote, NO-token quote,
-    selected-token executable entry price, and (elsewhere) the model / market
-    probabilities and official settlement. A YES price is never reused as a NO
-    price. When the executable price of the token actually taken cannot be
-    captured (e.g. the NO book was not subscribed), the record is explicitly
-    marked ``economic_pnl_unavailable`` with a reason instead of substituting a
-    derived or model value.
+    selected-token executable entry price, paper-execution (VWAP) fill, and
+    (elsewhere) the model / market probabilities and official settlement. A YES
+    price is never reused as a NO price. When the executable price of the token
+    actually taken cannot be captured (e.g. the NO book was missing, stale,
+    crossed, or invalid) the record is explicitly marked
+    ``economic_pnl_unavailable`` with a reason instead of substituting a derived
+    or model value.
     """
     q = quote or {}
     yes_bid = q.get("yes_bid")
@@ -125,14 +129,26 @@ def _forward_schema_fields(
         selected_token_id = yes_token_id
         selected_exec_price = float(yes_ask) if yes_ask is not None else None
         exec_source = "yes_ask" if yes_ask is not None else "unavailable"
+        selected_ask_size = q.get("yes_ask_size")
+        selected_ask_ladder = q.get("yes_ask_ladder")
+        selected_quote_ts = q.get("yes_quote_timestamp")
+        selected_quote_age = q.get("yes_quote_age_s")
     elif shadow_direction == "short":
         selected_token_id = no_token_id
         selected_exec_price = float(no_ask) if no_ask is not None else None
         exec_source = "no_ask" if no_ask is not None else "unavailable"
+        selected_ask_size = q.get("no_ask_size")
+        selected_ask_ladder = q.get("no_ask_ladder")
+        selected_quote_ts = q.get("no_quote_timestamp")
+        selected_quote_age = q.get("no_quote_age_s")
     else:
         selected_token_id = None
         selected_exec_price = None
         exec_source = "n/a_no_trade"
+        selected_ask_size = None
+        selected_ask_ladder = None
+        selected_quote_ts = None
+        selected_quote_age = None
 
     economic_pnl_unavailable = selected_exec_price is None
     if economic_pnl_unavailable:
@@ -147,27 +163,98 @@ def _forward_schema_fields(
     else:
         reason = None
 
+    # -- paper-execution (VWAP) fill on the selected token's ask depth -------
+    # Uses the contemporaneous ask ladder when present; falls back to a single
+    # observed level (best ask + its size) — never fabricates deeper liquidity.
+    ladder = selected_ask_ladder
+    if not ladder and selected_exec_price is not None and selected_ask_size:
+        ladder = [(selected_exec_price, selected_ask_size)]
+    requested_stake = q.get("paper_fixed_risk", paper_execution.DEFAULT_FIXED_RISK)
+    if selected_exec_price is None:
+        paper = paper_execution.simulate_fill(None, requested_stake=requested_stake)
+    else:
+        paper = paper_execution.simulate_fill(ladder, requested_stake=requested_stake)
+    executable_economic_available = (
+        not economic_pnl_unavailable
+        and paper["fill_status"] in (paper_execution.FILLED,
+                                     paper_execution.PARTIALLY_FILLED))
+
+    # -- side-level validation flags (merged with book-level flags) ---------
+    flags = dict(q.get("validation_flags") or {})
+    flags["selected_token_matches_side"] = (
+        shadow_direction not in ("long", "short")
+        or selected_token_id == (yes_token_id if shadow_direction == "long"
+                                 else no_token_id))
+    quote_before_or_at_decision = True
+    if decision_timestamp is not None and selected_quote_ts is not None:
+        try:
+            from datetime import datetime as _dt
+            dec = _dt.fromisoformat(str(decision_timestamp).replace("Z", "+00:00"))
+            dec_epoch = dec.timestamp()
+            # allow 1s tolerance for same-instant record ordering
+            quote_before_or_at_decision = float(selected_quote_ts) <= dec_epoch + 1.0
+        except (ValueError, TypeError):
+            quote_before_or_at_decision = True
+    flags["quote_before_or_at_decision"] = quote_before_or_at_decision
+
     return {
         "schema_version": SHADOW_SCHEMA_VERSION,
         "condition_id": q.get("condition_id"),
+        "market_id_v2": q.get("market_id"),
         "market_start_time": q.get("market_start_time"),
         "market_end_time": q.get("market_end_time"),
         "yes_token_id": yes_token_id,
         "no_token_id": no_token_id,
         "selected_token_id": selected_token_id,
+        # YES book
         "yes_bid": yes_bid,
         "yes_ask": yes_ask,
         "yes_mid": yes_mid,
+        "yes_bid_size": q.get("yes_bid_size"),
+        "yes_ask_size": q.get("yes_ask_size"),
+        "yes_quote_timestamp": q.get("yes_quote_timestamp"),
+        "yes_quote_age_s": q.get("yes_quote_age_s"),
+        "yes_book_status": q.get("yes_book_status"),
+        # NO book
         "no_bid": no_bid,
         "no_ask": no_ask,
         "no_mid": no_mid,
         "no_mid_source": no_mid_source,
+        "no_bid_size": q.get("no_bid_size"),
+        "no_ask_size": q.get("no_ask_size"),
+        "no_quote_timestamp": q.get("no_quote_timestamp"),
+        "no_quote_age_s": q.get("no_quote_age_s"),
+        "no_book_status": q.get("no_book_status"),
+        # cross-book + provenance
+        "cross_book_skew_s": q.get("cross_book_skew_s"),
+        "book_generation": q.get("book_generation"),
         "quote_timestamp": q.get("quote_timestamp"),
         "quote_source": q.get("quote_source"),
+        # selected-token executable entry
         "selected_exec_price": selected_exec_price,
         "selected_exec_price_source": exec_source,
+        "selected_token_ask_size": selected_ask_size,
+        "selected_quote_age_s": selected_quote_age,
         "economic_pnl_unavailable": economic_pnl_unavailable,
         "economic_pnl_unavailable_reason": reason,
+        # paper-execution (diagnostic VWAP fill; separate from strategy sizing)
+        "paper_requested_stake": paper.get("requested_stake"),
+        "paper_requested_shares": paper.get("requested_shares"),
+        "paper_fill_status": paper.get("fill_status"),
+        "paper_filled_shares": paper.get("filled_shares"),
+        "paper_spent": paper.get("spent"),
+        "paper_vwap": paper.get("vwap"),
+        "paper_unfilled_stake": paper.get("unfilled_stake"),
+        "paper_top_ask": paper.get("top_ask"),
+        "paper_top_ask_size": paper.get("top_ask_size"),
+        "paper_ask_levels_used": paper.get("ask_levels_used"),
+        "paper_slippage_model": paper.get("slippage_model"),
+        "paper_fee_rate": paper.get("fee_rate"),
+        "paper_fee_source": paper.get("fee_source"),
+        "paper_pre_fee": paper.get("pre_fee"),
+        "executable_economic_available": executable_economic_available,
+        # validation
+        "validation_flags": flags,
     }
 
 
@@ -459,6 +546,7 @@ class ShadowEvaluator:
         forward = _forward_schema_fields(
             shadow_direction, kwargs.get("entry_price"),
             kwargs.get("executable_quote"),
+            decision_timestamp=kwargs.get("timestamp"),
         )
 
         return {

@@ -46,6 +46,16 @@ DEFAULTS: dict[str, Any] = {
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "journal_path": "trade_journal.json",
+
+    # Dual-token order-book capture thresholds (diagnostic only)
+    "market_data": {
+        "quote_freshness_seconds": 60,
+        "cross_book_skew_warn_seconds": 5,
+        "max_spread_warn": 0.10,
+        "sum_bid_max": 1.05,
+        "sum_ask_min": 0.95,
+        "paper_fixed_risk": 1.00,
+    },
 }
 
 # Fields that should NEVER be printed in logs or output

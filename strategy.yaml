@@ -45,6 +45,24 @@ watchdog_enabled: true
 watchdog_stale_minutes: 45
 watchdog_heartbeat_path: "logs/bot_heartbeat.json"
 
+# Dual-token order-book capture (DIAGNOSTIC ONLY — never a trading gate).
+# Controls freshness/skew/quality thresholds for the per-token book store that
+# records the contemporaneous YES and NO asks. Changing these never alters any
+# signal, side selection, Kelly, Markov, threshold, or sizing policy.
+market_data:
+  # A token book older than this (seconds) is not treated as executable.
+  quote_freshness_seconds: 60
+  # YES/NO quote-timestamp skew beyond this (seconds) is flagged (non-blocking).
+  cross_book_skew_warn_seconds: 5
+  # A bid-ask spread wider than this is flagged (non-blocking).
+  max_spread_warn: 0.10
+  # yes_bid + no_bid above this is suspicious (books should sum to ~1).
+  sum_bid_max: 1.05
+  # yes_ask + no_ask below this is suspicious.
+  sum_ask_min: 0.95
+  # Fixed maximum risk ($ max loss) for the diagnostic paper-execution fill.
+  paper_fixed_risk: 1.00
+
 # Regime diagnostics (Phase 1) — DIAGNOSTICS ONLY, never a trading gate.
 # Macro daily candles are cached locally and refreshed only on age threshold;
 # they are never fetched inside the hot decision loop.
