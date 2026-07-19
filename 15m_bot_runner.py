@@ -207,12 +207,28 @@ class RunnerWatchdog:
         except PermissionError:
             pass  # Process exists but we can't signal it
 
-        # Check heartbeat freshness
-        heartbeat_age = self._get_file_age(HEARTBEAT_FILE)
+        # Check heartbeat freshness. Only a heartbeat written by the CURRENT
+        # run session counts; a leftover heartbeat from a PREVIOUS run is
+        # ignored so it cannot trigger a false heartbeat_stale restart while the
+        # child is still bootstrapping (before it writes its first fresh
+        # heartbeat). This mirrors the journal/shadow staleness scoping below.
+        # Real stalls are still caught: once a fresh heartbeat exists staleness
+        # applies normally, and a child that never produces a fresh heartbeat
+        # within a full stale window after run start is restarted as a genuine
+        # startup stall (heartbeat_never_fresh) rather than silently ignored.
+        heartbeat_age = self._get_file_age(
+            HEARTBEAT_FILE, min_mtime=self.run_start_ts
+        )
         if heartbeat_age is not None and heartbeat_age > self.stale_threshold:
             print(f"[WATCHDOG] Heartbeat stale for {heartbeat_age:.0f}s (threshold: {self.stale_threshold}s)")
             self._restart_child(child_pid, "heartbeat_stale")
             return
+        if heartbeat_age is None and self.run_start_ts is not None:
+            startup_age = time.time() - self.run_start_ts
+            if startup_age > self.stale_threshold:
+                print(f"[WATCHDOG] No fresh heartbeat {startup_age:.0f}s after run start (threshold: {self.stale_threshold}s)")
+                self._restart_child(child_pid, "heartbeat_never_fresh")
+                return
 
         # Check journal freshness. Only consider journal files from the CURRENT
         # run session; files from previous runs/days are ignored. If no
@@ -226,12 +242,17 @@ class RunnerWatchdog:
             self._restart_child(child_pid, "journal_stale")
             return
 
-    def _get_file_age(self, filepath: str) -> Optional[float]:
-        """Get age of a file in seconds. Returns None if file doesn't exist."""
+    def _get_file_age(self, filepath: str, min_mtime: Optional[float] = None) -> Optional[float]:
+        """Get age of a file in seconds. Returns None if the file doesn't exist,
+        or — when ``min_mtime`` is given — if it was last modified before
+        ``min_mtime`` (used to ignore stale files left by previous run
+        sessions)."""
         try:
             path = project_root / filepath
             if path.exists():
                 mtime = path.stat().st_mtime
+                if min_mtime is not None and mtime < min_mtime:
+                    return None
                 return time.time() - mtime
         except Exception:
             pass

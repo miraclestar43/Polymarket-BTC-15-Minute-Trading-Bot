@@ -176,9 +176,15 @@ def test_check_health_still_restarts_on_stale_heartbeat(monkeypatch, tmp_path):
     logs = tmp_path / "logs"
     hb = logs / "bot_heartbeat.json"
     hb.write_text("{}")
-    old = _time.time() - (runner.STALE_THRESHOLD_SECONDS + 600)
-    _os.utime(hb, (old, old))
-    wd.set_run_start(_time.time())
+    base = _time.time()
+    wd.set_run_start(base)
+    # A FRESH heartbeat written by THIS run (after run start) that then goes
+    # stale. A heartbeat older than run_start is a prior-run artifact and is
+    # intentionally ignored (see test_watchdog_startup_falsepositive).
+    fresh = base + 10
+    _os.utime(hb, (fresh, fresh))
+    monkeypatch.setattr(runner.time, "time",
+                        lambda: fresh + runner.STALE_THRESHOLD_SECONDS + 600)
 
     monkeypatch.setattr(runner.os, "kill", lambda *a, **k: None)
     calls = []
