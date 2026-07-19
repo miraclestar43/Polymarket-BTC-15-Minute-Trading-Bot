@@ -106,3 +106,18 @@ Do **not** treat any historical economic P/L as evidence of edge. Only
 directional accuracy is established. A forward DRY-RUN with schema v2 is required
 to gather **executable** NO-side quotes before any economic conclusion — and
 before any consideration of live trading.
+
+## 8. NO-book capture closed (2026-07-19)
+
+The blocker in §7 — no executable NO quote — is now resolved at the source.
+Both outcome order books are subscribed and maintained by token id
+(`DualBookStore`); a SHORT now prices off the **observed NO ask** (never the YES
+midpoint, never `1 − yes_mid`, never a closed-market quote), and a realistic
+VWAP paper fill against observed ask depth is recorded. A live read-only smoke
+test captured a real NO ask (both books `ok`, all validation flags healthy),
+proving the capability end-to-end.
+
+This is an **instrumentation** fix, not a new edge: strategy logic is unchanged
+and no forward economic run was collected in this session. A fresh DRY-RUN is
+still required to accumulate executable SHORT economics before any conclusion.
+See [PAPER_EXECUTION_MODEL.md](PAPER_EXECUTION_MODEL.md).

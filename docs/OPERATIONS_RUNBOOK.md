@@ -78,10 +78,34 @@ corrected synthetic economics; recorded economic P/L is reported as
 Re-checks the on-disk store invariants over a seeded sample (≥50) plus every
 top-30 P/L market; writes `logs/official_resolution_audit.md` + fixture.
 
+## 6b. Dual-book NO-ask connectivity smoke test (read-only, bounded)
+
+```bash
+# proves a REAL, contemporaneous NO-token ask is obtainable; ≤600s hard cap.
+.venv/bin/python scripts/no_book_smoke_test.py --duration 180 --interval 30 --json
+```
+
+Read-only HTTP GET only. Never starts the runner, `--live`, or any order path.
+Expect `"result": "PASS"` with `captured_executable_no_ask` set and all
+`validation_flags` true. Offline: add `--fixtures f.json --once`.
+
+## 6c. Rebuild the official-resolution store safely (read-only fetch)
+
+```bash
+# report first (never writes the active store):
+.venv/bin/python scripts/rebuild_official_resolutions.py --all --report-only --json
+# apply (replaces active store ONLY if validation fully succeeds; backup kept):
+.venv/bin/python scripts/rebuild_official_resolutions.py --all --json
+```
+
+Backs up the store to `official_resolutions.jsonl.backup-<ts>`, re-fetches every
+condition id with the hardened parser, and replaces the active store only when
+no mismatch/regression is found. A network failure leaves the store intact.
+
 ## 7. Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # expect 263 passed
+.venv/bin/python -m pytest tests/ -q     # expect 306 passed
 ```
 
 ## 7b. Watchdog startup false-positive (fixed 2026-07-19)

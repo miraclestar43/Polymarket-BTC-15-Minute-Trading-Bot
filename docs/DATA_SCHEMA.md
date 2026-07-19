@@ -97,3 +97,48 @@ Executable-price capture by side (verified live):
   `selected_exec_price = null`, `economic_pnl_unavailable = true`
   (`economic_pnl_unavailable_reason = "no_token_ask_not_captured"`). The YES
   price is never substituted for the NO cost.
+
+## Schema-v2 full economic record (dual-book capture, 2026-07-19)
+
+With both outcome books subscribed (`DualBookStore`, keyed by token id), the
+`executable_quote` block is extended **additively** — no old field is redefined.
+A v1 reader still finds every original field; v2 readers gain the following.
+See [PAPER_EXECUTION_MODEL.md](PAPER_EXECUTION_MODEL.md) for the semantics.
+
+**Per-token quotes & sizes**
+
+| field | meaning |
+|-------|---------|
+| `yes_bid_size` / `yes_ask_size` | top-of-book YES sizes |
+| `no_bid_size` / `no_ask_size` | top-of-book NO sizes |
+| `yes_observed_bid/ask` / `no_observed_bid/ask` | last observed quote (recorded even when not executable) |
+| `yes_ask_ladder` / `no_ask_ladder` | observed ask ladder `[(price,size),…]` |
+| `selected_token_ask_size` | size at the selected token's top ask |
+
+**Timing / integrity**
+
+| field | meaning |
+|-------|---------|
+| `yes_quote_timestamp` / `no_quote_timestamp` | per-token quote capture epoch |
+| `yes_quote_age_s` / `no_quote_age_s` | quote age at snapshot |
+| `selected_quote_age_s` | age of the selected token's quote |
+| `cross_book_skew_s` | \|YES ts − NO ts\| |
+| `yes_book_status` / `no_book_status` | `ok`/`missing`/`stale`/`crossed`/`out_of_range`/`expired` |
+| `book_generation` | subscription/reconnect generation |
+| `validation_flags` | non-blocking booleans (True = healthy): `yes_bid_le_ask`, `no_bid_le_ask`, `prices_in_range`, `tokens_distinct`, `cross_book_skew_ok`, `yes_spread_ok`, `no_spread_ok`, `sum_bid_not_above_1`, `sum_ask_not_below_1`, `selected_token_matches_side`, `quote_before_or_at_decision` |
+
+**Paper execution (VWAP fill)**
+
+| field | meaning |
+|-------|---------|
+| `paper_requested_stake` / `paper_requested_shares` | fixed-risk stake and implied shares |
+| `paper_fill_status` | `filled` / `partially_filled` / `unavailable` |
+| `paper_filled_shares` / `paper_spent` / `paper_vwap` | depth-aware simulated fill |
+| `paper_unfilled_stake` | stake not filled from observed depth |
+| `paper_top_ask` / `paper_top_ask_size` / `paper_ask_levels_used` | ladder actually consumed |
+| `paper_slippage_model` | `walk_observed_ask_depth` |
+| `paper_fee_rate` / `paper_fee_source` / `paper_pre_fee` | fee assumptions (`pre_fee` when none exposed — never invented) |
+| `executable_economic_available` | true only when the selected book is `ok` and a fill was produced |
+
+`market_id_v2` carries the market id under a new key so the original `market_id`
+is never clobbered.

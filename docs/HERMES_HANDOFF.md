@@ -137,3 +137,16 @@ A `heartbeat_stale` within ~1\u20132 min of a `runner_start` is the (now-fixed)
 startup false-positive pattern; a `heartbeat_never_fresh` reason means a child
 never produced a fresh heartbeat within a full stale window \u2014 escalate to a
 human, do not raise the timeout.
+### 7.6 Dual-book NO-ask capability check (read-only)
+
+```bash
+# Bounded (\u2264600s), read-only GET; proves a real NO ask is obtainable.
+.venv/bin/python scripts/no_book_smoke_test.py --duration 180 --interval 30 --json
+# Expect "result": "PASS" with captured_executable_no_ask set and all
+# validation_flags true. In new schema-v2 records, shorts with both books ok
+# should now carry a non-null selected_exec_price sourced from the NO ask.
+```
+
+This smoke test never starts the runner, `--live`, or any order path. It is the
+canonical check that the NO-token executable-price capture is working. See
+[PAPER_EXECUTION_MODEL.md](PAPER_EXECUTION_MODEL.md).

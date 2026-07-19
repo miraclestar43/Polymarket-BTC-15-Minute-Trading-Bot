@@ -76,6 +76,35 @@ restarts a genuinely wedged startup (`heartbeat_never_fresh`) after a full
 stale window. Diagnostics smoke test still **PASS** (SIGUSR1 faulthandler,
 SIGUSR2 rich dump, secrets redacted, dir writable).
 
+## NO-token executable-price capture (2026-07-19, this session)
+
+The last missing end-to-end capability — capturing a **real, contemporaneous
+NO-token executable ask** — is now implemented and proven live. No strategy
+logic changed (Kelly/Markov/thresholds/side/sizing/probabilities untouched);
+`DRY_RUN=true` / `LIVE_TRADING_ACK=false` throughout; no runner started.
+
+- **Root cause of the old gap:** the bot subscribed only to the YES/Up
+  instrument; the NO instrument was stored but never subscribed, so SHORT
+  economics were (honestly) `economic_pnl_unavailable`.
+- **Dual-book capture:** new `core/market_data/dual_book.py::DualBookStore`
+  keyed **by token id**, subscribed to **both** books in `bot.py`, routes ticks
+  by token id, invalidates on reconnect (generation bump), rejects stale/
+  crossed/out-of-range/cross-market data.
+- **Realistic paper execution:** new `core/strategy_brain/paper_execution.py`
+  walks the observed ask ladder for a fixed-risk stake and records VWAP fill,
+  partial/unavailable status, and pre-fee/fee labelling — never fabricating
+  liquidity.
+- **Schema v2 extended additively** in `shadow_evaluator._forward_schema_fields`
+  (per-token sizes/timestamps/ages, cross-book skew, book status/generation,
+  validation flags, `paper_*` fill fields, `executable_economic_available`).
+- **Live smoke test PASS:** `scripts/no_book_smoke_test.py` captured a real NO
+  ask with both books `ok` and all validation flags healthy.
+- **Resolution store rebuilt safely** with the hardened parser via
+  `scripts/rebuild_official_resolutions.py` (backup kept; active store replaced
+  only on full validation).
+- **Tests:** full suite **306 passed** (263 baseline + 43 new deterministic
+  tests); preflight **OK**.
+
 ## Headline finding (CRITICAL)
 
 The historical "profitability" was **an artifact of a pricing bug**, not real
