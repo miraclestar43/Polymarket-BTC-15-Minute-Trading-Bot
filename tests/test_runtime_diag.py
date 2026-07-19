@@ -33,6 +33,27 @@ def test_redact_free_text():
     assert "***REDACTED***" in out
 
 
+def test_redact_url_query_string():
+    out = diag.redact_text(
+        "GET https://clob.example.com/order?api_key=SEK123&signature=SIG456&x=1")
+    assert "SEK123" not in out and "SIG456" not in out
+    assert "x=1" in out  # non-secret query params preserved
+
+
+def test_redact_bearer_header_masks_the_token_not_just_scheme():
+    out = diag.redact_text("Authorization: Bearer eyJhbGciOiJIUZI1NiJ9.abcDEF")
+    assert "eyJhbGciOiJIUZI1NiJ9.abcDEF" not in out
+    assert "***REDACTED***" in out
+
+
+def test_redact_pem_private_key_block():
+    pem = ("-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEI&secret&\n"
+           "-----END EC PRIVATE KEY-----")
+    out = diag.redact_text(f"loaded key {pem} done")
+    assert "MHcCAQEEI" not in out
+    assert "***REDACTED***" in out
+
+
 def test_redact_depth_bounded():
     # deeply nested structure must not recurse forever
     d = cur = {}

@@ -56,14 +56,27 @@ STATUS_TIMEOUT = "timeout"
 # Keys / substrings whose values must be redacted from any dump.
 _SECRET_KEY_RE = re.compile(
     r"(private[_-]?key|api[_-]?key|api[_-]?secret|secret|passphrase|password|"
-    r"token|authorization|auth|bearer|cookie|session)",
+    r"access[_-]?token|refresh[_-]?token|token|authorization|auth|bearer|"
+    r"signature|cookie|session|mnemonic|seed)",
     re.IGNORECASE,
 )
-# Free-text patterns like `api_key=abcd...` or `"secret": "abcd"`.
+# Free-text patterns like `api_key=abcd...` or `"secret": "abcd"`, including
+# values inside URL query strings (`?api_key=abcd&token=xyz`).
 _SECRET_TEXT_RE = re.compile(
     r"((?:private[_-]?key|api[_-]?key|api[_-]?secret|secret|passphrase|password|"
-    r"token|authorization|auth|bearer)\s*[=:]\s*[\"']?)([^\s\"',}]+)",
+    r"access[_-]?token|refresh[_-]?token|token|authorization|auth|"
+    r"signature|sig|apikey)\s*[=:]\s*[\"']?)([^\s\"',}&]+)",
     re.IGNORECASE,
+)
+# Authorization/Bearer headers: `Authorization: Bearer <token>` — redact the
+# token that FOLLOWS the scheme (the generic key=value rule would otherwise
+# stop at the space and leak the token).
+_BEARER_RE = re.compile(
+    r"(bearer\s+)([A-Za-z0-9\-._~+/]+=*)", re.IGNORECASE)
+# PEM private-key blocks.
+_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
 )
 _REDACTED = "***REDACTED***"
 
@@ -73,10 +86,19 @@ _REDACTED = "***REDACTED***"
 # ---------------------------------------------------------------------------
 
 def redact_text(text: str) -> str:
-    """Mask secret-looking `key=value` / `key: value` pairs in free text."""
+    """
+    Mask secret-looking `key=value` / `key: value` pairs in free text,
+    including URL query-string parameters, `Bearer <token>` authorization
+    headers, and PEM private-key blocks.
+    """
     if not text:
         return text
-    return _SECRET_TEXT_RE.sub(lambda m: m.group(1) + _REDACTED, text)
+    out = _PEM_RE.sub(_REDACTED, text)
+    # Bearer first: mask the token FOLLOWING the scheme before the generic
+    # key=value rule can consume `Authorization: Bearer` and stop at the space.
+    out = _BEARER_RE.sub(lambda m: m.group(1) + _REDACTED, out)
+    out = _SECRET_TEXT_RE.sub(lambda m: m.group(1) + _REDACTED, out)
+    return out
 
 
 def redact(obj: Any, _depth: int = 0) -> Any:
