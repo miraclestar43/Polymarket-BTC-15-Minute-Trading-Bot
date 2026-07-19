@@ -73,6 +73,102 @@ SHADOW_CONFIGS = [
 # APPENDED to the built-ins (never replaces baseline behavior).
 _SHADOW_CONFIG_FILE = "shadow_experiments.yaml"
 
+# Schema version for shadow decision records. v1 = original (entry_price is the
+# YES-token midpoint, no executable quote, no token ids). v2 adds an explicit,
+# self-describing executable-quote block so future records are auditable without
+# guessing which token a price refers to. Bumping this NEVER changes signal or
+# selection logic.
+SHADOW_SCHEMA_VERSION = 2
+
+
+def _forward_schema_fields(
+    shadow_direction: str,
+    yes_midpoint: Optional[float],
+    quote: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Build the v2 self-describing executable-quote block for one record.
+
+    Keeps the concepts strictly separate: YES-token quote, NO-token quote,
+    selected-token executable entry price, and (elsewhere) the model / market
+    probabilities and official settlement. A YES price is never reused as a NO
+    price. When the executable price of the token actually taken cannot be
+    captured (e.g. the NO book was not subscribed), the record is explicitly
+    marked ``economic_pnl_unavailable`` with a reason instead of substituting a
+    derived or model value.
+    """
+    q = quote or {}
+    yes_bid = q.get("yes_bid")
+    yes_ask = q.get("yes_ask")
+    # YES mid: prefer an explicit executable mid, else the recorded midpoint.
+    if yes_bid is not None and yes_ask is not None:
+        yes_mid = (float(yes_bid) + float(yes_ask)) / 2.0
+    else:
+        yes_mid = yes_midpoint
+    no_bid = q.get("no_bid")
+    no_ask = q.get("no_ask")
+    no_quote_captured = no_bid is not None and no_ask is not None
+    if no_quote_captured:
+        no_mid: Optional[float] = (float(no_bid) + float(no_ask)) / 2.0
+        no_mid_source = "no_book"
+    elif yes_mid is not None:
+        no_mid = 1.0 - float(yes_mid)
+        no_mid_source = "derived_from_yes_mid"  # NOT executable
+    else:
+        no_mid = None
+        no_mid_source = "unavailable"
+
+    yes_token_id = q.get("yes_token_id")
+    no_token_id = q.get("no_token_id")
+
+    if shadow_direction == "long":
+        selected_token_id = yes_token_id
+        selected_exec_price = float(yes_ask) if yes_ask is not None else None
+        exec_source = "yes_ask" if yes_ask is not None else "unavailable"
+    elif shadow_direction == "short":
+        selected_token_id = no_token_id
+        selected_exec_price = float(no_ask) if no_ask is not None else None
+        exec_source = "no_ask" if no_ask is not None else "unavailable"
+    else:
+        selected_token_id = None
+        selected_exec_price = None
+        exec_source = "n/a_no_trade"
+
+    economic_pnl_unavailable = selected_exec_price is None
+    if economic_pnl_unavailable:
+        if shadow_direction == "short" and not no_quote_captured:
+            reason = "no_token_ask_not_captured"
+        elif shadow_direction == "long" and yes_ask is None:
+            reason = "yes_token_ask_not_captured"
+        elif shadow_direction == "blocked_by_direction":
+            reason = "no_trade"
+        else:
+            reason = "executable_quote_unavailable"
+    else:
+        reason = None
+
+    return {
+        "schema_version": SHADOW_SCHEMA_VERSION,
+        "condition_id": q.get("condition_id"),
+        "market_start_time": q.get("market_start_time"),
+        "yes_token_id": yes_token_id,
+        "no_token_id": no_token_id,
+        "selected_token_id": selected_token_id,
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "yes_mid": yes_mid,
+        "no_bid": no_bid,
+        "no_ask": no_ask,
+        "no_mid": no_mid,
+        "no_mid_source": no_mid_source,
+        "quote_timestamp": q.get("quote_timestamp"),
+        "quote_source": q.get("quote_source"),
+        "selected_exec_price": selected_exec_price,
+        "selected_exec_price_source": exec_source,
+        "economic_pnl_unavailable": economic_pnl_unavailable,
+        "economic_pnl_unavailable_reason": reason,
+    }
+
 
 def load_shadow_configs(config_path: str = _SHADOW_CONFIG_FILE) -> List[Dict[str, Any]]:
     """
@@ -167,6 +263,7 @@ class ShadowEvaluator:
         market_slug: Optional[str] = None,
         market_question: Optional[str] = None,
         market_end_time: Optional[str] = None,
+        executable_quote: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Evaluate all shadow configs and write results.
@@ -215,6 +312,7 @@ class ShadowEvaluator:
                 market_slug=market_slug,
                 market_question=market_question,
                 market_end_time=market_end_time,
+                executable_quote=executable_quote,
             )
             records.append(record)
 
@@ -357,6 +455,11 @@ class ShadowEvaluator:
             "BUY NO" if shadow_direction == "short" else "N/A"
         )
 
+        forward = _forward_schema_fields(
+            shadow_direction, kwargs.get("entry_price"),
+            kwargs.get("executable_quote"),
+        )
+
         return {
             "timestamp": kwargs["timestamp"],
             "market_id": kwargs["market_id"],
@@ -414,6 +517,7 @@ class ShadowEvaluator:
             "shadow_skip_reason": shadow_skip_reason,
             "dry_run": True,
             "simulation": True,
+            **forward,
         }
 
 
@@ -454,6 +558,7 @@ def evaluate_shadow(
     market_slug: Optional[str] = None,
     market_question: Optional[str] = None,
     market_end_time: Optional[str] = None,
+    executable_quote: Optional[Dict[str, Any]] = None,
     log_dir: str = "logs",
 ) -> List[Dict[str, Any]]:
     """Convenience function to evaluate shadow configs."""
@@ -495,4 +600,5 @@ def evaluate_shadow(
         market_slug=market_slug,
         market_question=market_question,
         market_end_time=market_end_time,
+        executable_quote=executable_quote,
     )

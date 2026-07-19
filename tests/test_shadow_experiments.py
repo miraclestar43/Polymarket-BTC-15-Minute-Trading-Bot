@@ -119,7 +119,11 @@ def test_shadow_logs_have_no_secrets(tmp_path, monkeypatch):
         blob += f.read_text()
     assert "SECRET_TELEGRAM_TOKEN_123" not in blob
     assert "SECRET_CHAT_999" not in blob
-    for banned in ("token", "api_key", "secret", "password", "private_key"):
+    # Guard against real secret material. Note: benign market identifier fields
+    # such as "token_id" legitimately contain the word "token", so we match the
+    # actual secret key names (e.g. bot_token) rather than the bare word.
+    for banned in ("bot_token", "api_key", "api_secret", "password",
+                   "private_key", "passphrase"):
         assert banned not in blob.lower()
 
 

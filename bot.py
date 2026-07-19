@@ -879,6 +879,46 @@ class IntegratedBTCStrategy(Strategy):
     # Trading decision (unchanged)
     # ------------------------------------------------------------------
 
+    def _build_executable_quote(self, market_resolution: dict) -> dict:
+        """
+        Build the self-describing executable-quote block for shadow records
+        (schema v2). DIAGNOSTIC ONLY — this records the quote state we already
+        have at decision time; it makes NO network call, adds no latency, and
+        does NOT influence any decision.
+
+        We are subscribed to the YES/Up token, so we can record its live
+        bid/ask/mid and token id. The NO/Down book is not subscribed, so the
+        NO ask is not captured; the shadow evaluator marks short economics
+        ``economic_pnl_unavailable`` rather than deriving a NO cost. The YES
+        mid is never backfilled from a closed market's CLOB state.
+        """
+        bid = ask = None
+        try:
+            if self._last_bid_ask:
+                bid, ask = float(self._last_bid_ask[0]), float(self._last_bid_ask[1])
+        except Exception:
+            bid = ask = None
+        slug = market_resolution.get("market_slug") or ""
+        start_epoch = None
+        prefix = "btc-updown-15m-"
+        if slug.startswith(prefix):
+            try:
+                start_epoch = float(int(slug[len(prefix):]))
+            except (TypeError, ValueError):
+                start_epoch = None
+        return {
+            "yes_token_id": self._yes_token_id,
+            "no_token_id": None,  # NO/Down book not subscribed
+            "condition_id": market_resolution.get("condition_id"),
+            "market_start_time": start_epoch,
+            "yes_bid": bid,
+            "yes_ask": ask,
+            "no_bid": None,
+            "no_ask": None,
+            "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+            "quote_source": "yes_book_ws",
+        }
+
     def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
         # Convert float back to Decimal for processing
@@ -1118,6 +1158,7 @@ class IntegratedBTCStrategy(Strategy):
                     actual_event_type="skipped_trade",
                     actual_decision_reason=f"markov_persistence_below_threshold: {markov_result.reason}",
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    executable_quote=self._build_executable_quote(market_resolution),
                     market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                     direction="long" if "BULLISH" in direction_str else "short" if "BEARISH" in direction_str else "unknown",
                     entry_price=float(current_price),
@@ -1223,6 +1264,7 @@ class IntegratedBTCStrategy(Strategy):
                     actual_event_type="skipped_trade",
                     actual_decision_reason="trend_neutral_price_near_0.50",
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    executable_quote=self._build_executable_quote(market_resolution),
                     market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                     direction="unknown",
                     entry_price=price_float,
@@ -1308,6 +1350,7 @@ class IntegratedBTCStrategy(Strategy):
                         actual_event_type="skipped_trade",
                         actual_decision_reason=kelly_reason,
                         timestamp=datetime.now(timezone.utc).isoformat(),
+                        executable_quote=self._build_executable_quote(market_resolution),
                         market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                         direction=direction,
                         entry_price=entry_price,
@@ -1388,6 +1431,7 @@ class IntegratedBTCStrategy(Strategy):
                     actual_event_type="skipped_trade",
                     actual_decision_reason=f"kelly_no_edge: {kelly_reason}",
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    executable_quote=self._build_executable_quote(market_resolution),
                     market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                     direction=direction,
                     entry_price=entry_price,
@@ -1460,6 +1504,7 @@ class IntegratedBTCStrategy(Strategy):
                     actual_event_type="order_rejected",
                     actual_decision_reason=f"risk_engine_blocked: {error}",
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    executable_quote=self._build_executable_quote(market_resolution),
                     market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                     direction=direction,
                     entry_price=entry_price,
@@ -1526,6 +1571,7 @@ class IntegratedBTCStrategy(Strategy):
                 actual_event_type="decision",
                 actual_decision_reason=f"trade_authorized: {kelly_reason}",
                 timestamp=datetime.now(timezone.utc).isoformat(),
+                executable_quote=self._build_executable_quote(market_resolution),
                 market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                 direction=direction,
                 entry_price=float(entry_price),
@@ -1591,6 +1637,7 @@ class IntegratedBTCStrategy(Strategy):
                         actual_event_type="skipped_trade",
                         actual_decision_reason=f"no_liquidity_ask={float(last_ask):.4f}",
                         timestamp=datetime.now(timezone.utc).isoformat(),
+                        executable_quote=self._build_executable_quote(market_resolution),
                         market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                         direction="long",
                         entry_price=entry_price,
@@ -1647,6 +1694,7 @@ class IntegratedBTCStrategy(Strategy):
                         actual_event_type="skipped_trade",
                         actual_decision_reason=f"no_liquidity_bid={float(last_bid):.4f}",
                         timestamp=datetime.now(timezone.utc).isoformat(),
+                        executable_quote=self._build_executable_quote(market_resolution),
                         market_id=str(self.instrument_id) if self.instrument_id else "unknown",
                         direction="short",
                         entry_price=entry_price,
