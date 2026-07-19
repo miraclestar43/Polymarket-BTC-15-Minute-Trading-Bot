@@ -151,6 +151,7 @@ def _forward_schema_fields(
         "schema_version": SHADOW_SCHEMA_VERSION,
         "condition_id": q.get("condition_id"),
         "market_start_time": q.get("market_start_time"),
+        "market_end_time": q.get("market_end_time"),
         "yes_token_id": yes_token_id,
         "no_token_id": no_token_id,
         "selected_token_id": selected_token_id,

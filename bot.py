@@ -906,11 +906,23 @@ class IntegratedBTCStrategy(Strategy):
                 start_epoch = float(int(slug[len(prefix):]))
             except (TypeError, ValueError):
                 start_epoch = None
+        # 15-minute markets close 900s after the slug start epoch.
+        end_epoch = start_epoch + 900.0 if start_epoch is not None else None
+        # condition_id is deterministically embedded in the market id
+        # (format: ``0x{condition_id}-{token_id}.POLYMARKET``); prefer an
+        # explicit value if the resolver provided one, else parse it locally
+        # (no network call, no closed-market state involved).
+        condition_id = market_resolution.get("condition_id")
+        if not condition_id and self.instrument_id:
+            mid = str(self.instrument_id)
+            if mid.startswith("0x") and "-" in mid:
+                condition_id = mid.split("-", 1)[0]
         return {
             "yes_token_id": self._yes_token_id,
             "no_token_id": None,  # NO/Down book not subscribed
-            "condition_id": market_resolution.get("condition_id"),
+            "condition_id": condition_id,
             "market_start_time": start_epoch,
+            "market_end_time": end_epoch,
             "yes_bid": bid,
             "yes_ask": ask,
             "no_bid": None,

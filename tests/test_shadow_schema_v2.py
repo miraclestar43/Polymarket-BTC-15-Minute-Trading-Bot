@@ -64,6 +64,21 @@ def test_no_quote_never_backfilled_from_missing_data():
     assert f["economic_pnl_unavailable"] is True
 
 
+def test_forward_block_carries_condition_id_and_market_end_time():
+    # Identity/timing fields must be captured contemporaneously in the v2 block
+    # when the quote provides them (deterministically derivable, no network).
+    q = {"yes_bid": 0.60, "yes_ask": 0.62, "yes_token_id": "YES1",
+         "condition_id": "0x" + "a" * 64,
+         "market_start_time": 1784439900.0,
+         "market_end_time": 1784440800.0}
+    f = _fields("long", 0.61, q)
+    assert f["condition_id"] == "0x" + "a" * 64
+    assert f["market_start_time"] == 1784439900.0
+    assert f["market_end_time"] == 1784440800.0
+    # end is exactly 900s after start for a 15-minute market
+    assert f["market_end_time"] - f["market_start_time"] == 900.0
+
+
 def test_evaluate_shadow_emits_v2_block(tmp_path):
     recs = se.evaluate_shadow(
         actual_event_type="skipped_trade",
