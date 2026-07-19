@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+Preflight for a DRY-RUN shadow run — SAFETY GATE, read-only.
+
+Verifies the environment is safe and ready BEFORE starting a dry-run, WITHOUT
+exposing any secret values. It never places orders, never enables live trading,
+and never prints keys/tokens/addresses.
+
+Checks:
+  * dry-run posture: config `dry_run=true` and `LIVE_TRADING_ACK` != true,
+  * no `--live` in this invocation's arguments,
+  * required directories exist / are writable (logs, logs/diagnostics),
+  * key data files present with a recognisable schema,
+  * network/DNS reachability of the CLOB host (DNS only — no API call),
+  * safety service state (polymarket-dryrun.service) reported (not started),
+  * diagnostic signal readiness (SIGUSR1/SIGUSR2 installable).
+
+Exit 0 = safe to proceed. Non-zero = at least one blocking check failed.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+CLOB_HOST = "clob.polymarket.com"
+REQUIRED_DIRS = ["logs", "logs/diagnostics"]
+
+PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+
+
+class Check:
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, str, str]] = []
+        self.blocking_fail = False
+
+    def add(self, name: str, status: str, detail: str = "") -> None:
+        self.rows.append((name, status, detail))
+        if status == FAIL:
+            self.blocking_fail = True
+
+    def render(self) -> str:
+        width = max(len(n) for n, _, _ in self.rows)
+        lines = ["=== DRY-RUN PREFLIGHT ==="]
+        for name, status, detail in self.rows:
+            lines.append(f"  [{status}] {name.ljust(width)}  {detail}")
+        lines.append("")
+        lines.append("RESULT: " + ("BLOCKED" if self.blocking_fail else "OK — safe to proceed"))
+        return "\n".join(lines)
+
+
+def _check_dry_run(chk: Check) -> None:
+    try:
+        os.chdir(PROJECT_ROOT)
+        from config import load_strategy_config  # local import; no secrets printed
+        cfg = load_strategy_config()
+        dry = bool(cfg.get("dry_run", True))
+        ack = bool(cfg.get("live_trading_ack", False))
+        chk.add("dry_run=true", PASS if dry else FAIL,
+                "" if dry else "config dry_run is not true")
+        # ack is derived only from LIVE_TRADING_ACK env; we report the boolean,
+        # never the value of any secret.
+        chk.add("LIVE_TRADING_ACK not true", PASS if not ack else FAIL,
+                "" if not ack else "LIVE_TRADING_ACK=true would allow live orders")
+    except Exception as e:  # noqa: BLE001
+        chk.add("dry_run posture", FAIL, f"could not load config: {type(e).__name__}")
+
+
+def _check_no_live_flag(chk: Check, argv: list[str]) -> None:
+    live = "--live" in argv
+    chk.add("no --live flag", PASS if not live else FAIL,
+            "" if not live else "remove --live to stay in dry-run")
+
+
+def _check_dirs(chk: Check) -> None:
+    for rel in REQUIRED_DIRS:
+        p = PROJECT_ROOT / rel
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".preflight_write_test"
+            probe.write_text("ok")
+            probe.unlink()
+            chk.add(f"dir writable: {rel}", PASS)
+        except OSError as e:
+            chk.add(f"dir writable: {rel}", FAIL, str(e))
+
+
+def _check_data_files(chk: Check) -> None:
+    logs = PROJECT_ROOT / "logs"
+    shadow = list(logs.glob("shadow_decisions_*.jsonl"))
+    chk.add("shadow decision logs present",
+            PASS if shadow else WARN,
+            f"{len(shadow)} file(s)" if shadow else "none yet (ok for a fresh run)")
+    store = logs / "official_resolutions.jsonl"
+    chk.add("official resolution store",
+            PASS if store.exists() else WARN,
+            "present" if store.exists() else "absent (ok for a fresh run)")
+
+
+def _check_dns(chk: Check) -> None:
+    # DNS only — we do NOT open a socket to the API or send any request.
+    try:
+        socket.getaddrinfo(CLOB_HOST, 443)
+        chk.add(f"DNS resolves {CLOB_HOST}", PASS)
+    except socket.gaierror as e:
+        chk.add(f"DNS resolves {CLOB_HOST}", WARN, f"resolution failed: {e}")
+
+
+def _check_service(chk: Check) -> None:
+    try:
+        out = subprocess.run(
+            ["systemctl", "is-active", "polymarket-dryrun.service"],
+            capture_output=True, text=True, timeout=5)
+        state = out.stdout.strip() or "unknown"
+        # We only report state; we do NOT start/stop anything.
+        chk.add("polymarket-dryrun.service state", PASS, state)
+    except (OSError, subprocess.SubprocessError):
+        chk.add("polymarket-dryrun.service state", WARN, "systemctl unavailable")
+
+
+def _check_diag_signals(chk: Check) -> None:
+    import signal as _sig
+    have = all(getattr(_sig, s, None) is not None for s in ("SIGUSR1", "SIGUSR2"))
+    chk.add("diagnostic signals available", PASS if have else WARN,
+            "SIGUSR1/SIGUSR2" if have else "not on this platform")
+    try:
+        from core.diagnostics import runtime_diag as diag
+        status = diag.install_diagnostics(
+            dump_dir=str(PROJECT_ROOT / "logs" / "diagnostics"))
+        ok = status.get("native") and status.get("rich")
+        chk.add("diagnostics installable", PASS if ok else WARN,
+                f"native={status.get('native')} rich={status.get('rich')}")
+    except Exception as e:  # noqa: BLE001
+        chk.add("diagnostics installable", WARN, f"{type(e).__name__}")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="DRY-RUN preflight (read-only).")
+    ap.add_argument("run_args", nargs="*",
+                    help="the args you intend to pass to 15m_bot_runner.py")
+    args = ap.parse_args(argv)
+
+    chk = Check()
+    _check_dry_run(chk)
+    _check_no_live_flag(chk, args.run_args)
+    _check_dirs(chk)
+    _check_data_files(chk)
+    _check_dns(chk)
+    _check_service(chk)
+    _check_diag_signals(chk)
+
+    print(chk.render())
+    return 1 if chk.blocking_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
