@@ -2,6 +2,8 @@
 
 _Last updated: 2026-07-19 (final handoff session). DRY-RUN ONLY._
 
+_Handoff content HEAD: 983698141270f2e4946253b04507aa6ffb22a1da (this doc-stamp commit is its child). Exact final HEAD is recorded in polymarket-final-handoff.manifest.txt._
+
 ## What this project is
 
 A shadow/paper research harness for a BTC 15-minute Up/Down strategy on
