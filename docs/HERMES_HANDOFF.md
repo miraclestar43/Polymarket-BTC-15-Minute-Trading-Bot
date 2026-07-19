@@ -65,3 +65,75 @@ hermes send "polymarket dry-run: heartbeat stale > 15m — check the runner"
 hermes sessions list        # recent Hermes monitoring sessions
 hermes logs                 # Hermes run logs
 ```
+
+## 7. Hermes command sets (final handoff)
+
+Hermes is a **monitoring** agent. It must **not** edit strategy code, change
+trading parameters, or initiate live trading. All prompts below are read-only
+(`-t files`).
+
+### 7.1 Daily monitoring prompt
+
+```bash
+hermes -z "In ~/polymarket-BTC-15-Minute-Trading-Bot report: (1) is \
+15m_bot_runner.py running, (2) age of logs/bot_heartbeat.json, (3) any \
+watchdog_restart events in logs/runner_events.jsonl in the last 24h and their \
+reason, (4) count of new logs/diagnostics/stall_diag_*.json today. Report only, \
+change nothing." -t files
+```
+
+### 7.2 Post-run analysis prompt
+
+```bash
+hermes -z "For ~/polymarket-BTC-15-Minute-Trading-Bot, using the most recent \
+runner_start..(next runner_start|now) window from logs/runner_events.jsonl, run \
+(read-only) scripts/post_run_report.py and scripts/forensic_v2_run.py for that \
+window and summarise: record count, would_trade count, directional accuracy per \
+variant with n, view-B executable economics (LONG only), the unavailable set, \
+and any forensic anomaly flags. Do not present view-C midpoint P/L as achieved. \
+Do not change strategy or start a run." -t files
+```
+
+### 7.3 Schema-v2 quote-completeness commands
+
+```bash
+# Every new record must be schema_version 2; shorts must be honest.
+D=logs/shadow_decisions_$(date -u +%F).jsonl
+python3 -c "import json,sys; rs=[json.loads(l) for l in open('$D')]; \
+print('records',len(rs),'v2',sum(r.get(\"schema_version\")==2 for r in rs)); \
+print('short_unavailable_ok', all(r.get(\"economic_pnl_unavailable\") \
+for r in rs if r.get(\"shadow_side\")==\"short\")); \
+print('long_uses_yes_ask', all(r.get(\"selected_exec_price_source\")==\"yes_ask\" \
+for r in rs if r.get(\"shadow_side\")==\"long\" and r.get(\"would_trade\")))"
+```
+
+### 7.4 Official settlement-coverage commands
+
+```bash
+# Every resolved would_trade market should be covered in the settlement store.
+python3 -c "import json; s=[json.loads(l) for l in \
+open('logs/settlements.jsonl')]; \
+from collections import Counter; c=Counter(x.get('resolution_status') for x in s); \
+print('settlements', c)"
+# Backfill + sweep are read-mostly but hit the network; a human runs these:
+#   .venv/bin/python scripts/backfill_official_resolutions.py --since <ISO> --until <ISO>
+#   .venv/bin/python scripts/sweep_settlements.py
+```
+
+### 7.5 Watchdog diagnostics commands
+
+```bash
+# Recent watchdog restarts + reasons, and captured diagnostics.
+python3 -c "import json; e=[json.loads(l) for l in \
+open('logs/runner_events.jsonl')]; \
+print([(x['t'],x.get('reason')) for x in e \
+if x.get('event_type')=='watchdog_restart'][-10:])"
+ls -lt logs/diagnostics/stall_diag_*.json | head
+# Verify the diagnostics path itself is healthy (must print RESULT: PASS):
+.venv/bin/python scripts/diag_stall_smoke_test.py
+```
+
+A `heartbeat_stale` within ~1\u20132 min of a `runner_start` is the (now-fixed)
+startup false-positive pattern; a `heartbeat_never_fresh` reason means a child
+never produced a fresh heartbeat within a full stale window \u2014 escalate to a
+human, do not raise the timeout.

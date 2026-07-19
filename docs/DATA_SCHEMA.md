@@ -77,3 +77,23 @@ Per-record: `status`, `resolved_outcome` (UP/DOWN), `condition_id`,
 `clob-resolution-2`) `losing_token_id`, `winning_price`, `tokens_summary`,
 `parser_version`. Trust requires `requested==returned` condition id, a single
 winner, and an Up/Down label — `price==1` alone is insufficient.
+
+## Schema-v2 completeness (2026-07-19)
+
+The self-describing `executable_quote` block now also carries two fields that
+were previously left null but are derivable from data already in the record
+(no network call, no strategy impact):
+
+- `condition_id` — from `market_resolution.condition_id`, else parsed from the
+  instrument id (`"0x"+64hex` before the `-` token-id separator).
+- `market_end_time` — `market_start_time + 900` (15-minute market).
+
+Executable-price capture by side (verified live):
+
+- **LONG (BUY YES):** `selected_token_id = yes_token_id`,
+  `selected_exec_price = yes_ask`, `selected_exec_price_source = "yes_ask"`,
+  `economic_pnl_unavailable = false`.
+- **SHORT (BUY NO):** NO book not subscribed →
+  `selected_exec_price = null`, `economic_pnl_unavailable = true`
+  (`economic_pnl_unavailable_reason = "no_token_ask_not_captured"`). The YES
+  price is never substituted for the NO cost.

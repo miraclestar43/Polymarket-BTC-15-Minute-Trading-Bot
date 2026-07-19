@@ -73,7 +73,32 @@ Produced by `scripts/corrected_conclusions.py`:
   `economic_pnl_unavailable` flag (see `DATA_SCHEMA.md`).
 - Official-resolution parser hardened against the Gamma `data[0]` wrong-market
   class of bug (condition-id match required; `price==1` alone insufficient).
-- Regression tests lock in every fix (252 tests pass).
+- Regression tests lock in every fix (263 tests pass).
+
+## 6b. New-run audit (2026-07-19 dry-run, schema v2 live)
+
+Window **2026-07-19T05:19:21Z → 15:13:03Z** (explicit, from
+`runner_events.jsonl`; not `--latest-run`). 615 records, all `schema_version 2`.
+
+- **SHORT is now honest:** with no NO book subscribed, shorts record
+  `selected_exec_price=None`, `economic_pnl_unavailable=True`
+  (`no_token_ask_not_captured`) — the YES price is **never** reused as the NO
+  cost. This is the fixed behaviour, observed live.
+- **LONG is executable:** longs select the YES token and pay the **YES ask**
+  (`selected_exec_price_source="yes_ask"`), so view-B economics exist for them.
+- **Forensic scan of all 615 records:** 0 anomalies across 12 failure modes
+  (`logs/forensic_v2_run.csv`, 61 trades, 0 flags). Quotes contemporaneous;
+  decisions ~2 min before close; settlement 23/23 resolved.
+- **Three separated views** (`logs/post_run_report.md`): A directional accuracy
+  1.0 but **tiny n** (not meaningful); B executable economics available for
+  LONG only (e.g. shadow_no_kelly 10 longs, +$0.95 at $1 risk, ROR 9.5%),
+  SHORT unavailable; C the unavailable set reported explicitly.
+- **No new edge established.** LONG economics are now capturable but n is tiny
+  and all SHORT economics remain unavailable (NO book not captured).
+- **Watchdog:** one `heartbeat_stale` at +63 s was a **proven startup false
+  positive** (unscoped heartbeat check vs a prior-run heartbeat); fixed by
+  scoping to `run_start_ts` with a startup grace. `stall_diag` showed no
+  blocking operation.
 
 ## 7. Recommendation
 

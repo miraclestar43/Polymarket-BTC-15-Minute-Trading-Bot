@@ -1,6 +1,6 @@
 # PROJECT STATE
 
-_Last updated: 2026-07-19 (forensic-audit session). DRY-RUN ONLY._
+_Last updated: 2026-07-19 (final handoff session). DRY-RUN ONLY._
 
 ## What this project is
 
@@ -14,6 +14,65 @@ live orders** while `DRY_RUN=true` / `LIVE_TRADING_ACK=false`.
 - `LIVE_TRADING_ACK=false` (only ever read from `.env`, never from YAML).
 - `polymarket-dryrun.service` is **inactive/disabled** — untouched this session.
 - No live order path is enabled.
+
+## New-run audit (2026-07-19 dry-run, schema-v2 live)
+
+A fresh dry-run was audited over an explicit window
+**2026-07-19T05:19:21Z → 15:13:03Z** (runner_start pid 10333, `bot_args=[]` —
+confirms no `--live`). The window was selected from `runner_events.jsonl`, not
+`--latest-run`. The runner self-restarts clean children ~every 90 min and was
+still running at audit time; it was **not** killed (safe dry-run).
+
+- **615** shadow records, **all `schema_version: 2`**; 61 `would_trade` across
+  variants; 41 unique markets.
+- **Schema-v2 quote capture verified:**
+  - **LONG (BUY YES)** selects the YES token and uses the **YES ask** as the
+    executable entry (`selected_exec_price_source="yes_ask"`) — economic P/L
+    **available**.
+  - **SHORT (BUY NO)** does **not** reuse the YES price. The NO book was not
+    subscribed, so `selected_exec_price=None` and
+    `economic_pnl_unavailable=True` (`no_token_ask_not_captured`). This is
+    honest — no YES-as-NO substitution, no midpoint guess.
+  - Two derivable completeness gaps were closed at source: `condition_id` and
+    `market_end_time` are now populated from data already in the record (no
+    network, no strategy impact) for **future** runs.
+- **Forensic scan of all 615 records:** zero anomalies across the 12 checked
+  failure modes (short-uses-yes, price out of (0,1), quote-after-decision,
+  stale quote, decision-after-close, exec==p_model, etc.). Per-trade CSV:
+  `logs/forensic_v2_run.csv` (61 trades, 0 anomaly flags, 39 unavailable /
+  22 executable). Quotes are contemporaneous (quote-age ≈ 0s), all decisions
+  ~2 min before close.
+- **Settlement:** 23/23 `would_trade` markets officially resolved and swept
+  (store now 751 resolved, 0 inferred, 0 unavailable).
+- **Three separated result views** (`logs/post_run_report.md`):
+  - **A directional** — accuracy 1.0 across variants but **tiny n** (baseline
+    n=3, shadow_no_kelly n=23, short_only n=2, long_only n=1); **not a
+    statistically meaningful edge**.
+  - **B executable economic** — now computed **only** from records with a valid
+    selected-token ask (LONG). e.g. shadow_no_kelly: 10 executable longs,
+    +$0.95 net at $1 fixed risk, ROR 9.5%, entry 0.63–0.99. **SHORT stays
+    UNAVAILABLE** (no NO ask) and is never priced off YES.
+  - **C unavailable** — 39/61 records lack an executable ask (all shorts +
+    no-trades); reported explicitly, never as synthetic P/L.
+- **No new economic edge established:** LONG executable economics are now
+  capturable but n is tiny, and all SHORT economics remain unavailable this run.
+
+### Watchdog startup false-positive (found + fixed)
+
+Exactly **one** `watchdog_restart` (`heartbeat_stale`) fired at
+**05:20:24Z, ~63 s after start** — impossible for a real 45-min stale window.
+Root cause **proven**: the heartbeat staleness check was the only liveness
+check **not scoped to `run_start_ts`** (journal/shadow already were), so it
+compared against a **previous run's** stale heartbeat file before the child
+wrote its first fresh heartbeat. The captured `stall_diag` shows empty
+`recent_ops`/`loop_lags`/`asyncio_tasks` and the main thread in
+`run_until_complete(run_async())` startup — **no blocking operation**.
+
+Fix (operational, **not** a timeout increase, **not** strategy logic): scope
+the heartbeat check to `run_start_ts` and add a startup grace that still
+restarts a genuinely wedged startup (`heartbeat_never_fresh`) after a full
+stale window. Diagnostics smoke test still **PASS** (SIGUSR1 faulthandler,
+SIGUSR2 rich dump, secrets redacted, dir writable).
 
 ## Headline finding (CRITICAL)
 
@@ -57,15 +116,39 @@ recorded economic P/L for baseline / short / shadow_no_kelly is **invalidated**.
 
 ## Test status
 
-`.venv/bin/python -m pytest tests/ -q` → **252 passed**.
+`.venv/bin/python -m pytest tests/ -q` → **263 passed** (was 252; +11 regression
+tests for schema-v2 completeness, executable-quote derivation, view-B
+economics, and the watchdog startup false-positive).
 
 ## Open risks / not done
 
-- Forward economic P/L will only become valid once **live executable NO-side
-  quotes** are captured during a real run (schema v2 is ready; needs a run).
-- The on-disk `official_resolutions.jsonl` store was built by the **old parser**
-  (no `losing_token_id`/`tokens_summary`); re-backfilling needs network and is
-  intentionally deferred (no live calls this session).
+- **SHORT economics still unavailable:** the NO order book is not subscribed,
+  so no executable NO ask is captured. Every SHORT remains
+  `economic_pnl_unavailable` and is never priced off YES. Capturing the NO book
+  is the single biggest gap before any short economic conclusion is possible.
+- **Sample size is far too small** for an economic or directional edge claim
+  (per-variant n in low single/double digits over ~10 h).
+- Forward LONG economic P/L is now capturable (schema v2, `yes_ask`), but is an
+  optimistic upper bound (ask fill, no extra fee/slippage modelled).
+- The on-disk `official_resolutions.jsonl` store's **older** records were built
+  by the pre-`clob-resolution-2` parser (no `losing_token_id`/`tokens_summary`);
+  new-run records are fully parsed.
+
+## Recommended next steps (research only)
+
+- **Next dry-run duration:** run continuously for **at least 5\u20137 days**
+  (~480\u2013670 fifteen-minute cycles) to accumulate a usable per-variant n, and
+  **subscribe the NO book** so SHORT executable economics become available.
+- **Minimum evidence before any strategy change:** a pre-registered hypothesis
+  plus **\u2265 300 resolved decisions per variant** with valid executable quotes,
+  a directional accuracy CI that excludes 0.5, **and** a positive view-B ROR
+  after modelled fees/slippage \u2014 across an out-of-sample window. Directional
+  accuracy alone is insufficient.
+
+## Live trading status
+
+**Live trading is NOT approved.** `DRY_RUN` must remain `true` and
+`LIVE_TRADING_ACK` `false`. No service is enabled and no order path is live.
 
 See `RESEARCH_FINDINGS.md` for the full audit and `DATA_SCHEMA.md` for the
 field-by-field data model.

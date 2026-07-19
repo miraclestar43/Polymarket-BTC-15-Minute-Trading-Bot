@@ -81,7 +81,29 @@ top-30 P/L market; writes `logs/official_resolution_audit.md` + fixture.
 ## 7. Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # expect 252 passed
+.venv/bin/python -m pytest tests/ -q     # expect 263 passed
+```
+
+## 7b. Watchdog startup false-positive (fixed 2026-07-19)
+
+The heartbeat staleness check is now scoped to the current run session
+(`run_start_ts`), matching the journal/shadow checks. A leftover heartbeat from
+a previous run can no longer trigger a spurious `heartbeat_stale` restart during
+startup. A genuinely wedged startup that never writes a fresh heartbeat within a
+full stale window is still restarted, with the distinct reason
+`heartbeat_never_fresh`. This did **not** change the 45-min stale threshold.
+
+Post-run / forensic commands (read-only):
+
+```bash
+# explicit-window three-view report
+.venv/bin/python scripts/post_run_report.py \
+    --since <ISO8601> --until <ISO8601>
+# per-trade forensic CSV (0 anomaly flags expected)
+.venv/bin/python scripts/forensic_v2_run.py \
+    --since <ISO8601> --until <ISO8601> --out logs/forensic_v2_run.csv
+# diagnostics smoke test (must print RESULT: PASS)
+.venv/bin/python scripts/diag_stall_smoke_test.py
 ```
 
 ## 8. Hermes monitor (handoff)
