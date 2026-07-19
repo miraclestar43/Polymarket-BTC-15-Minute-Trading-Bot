@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.strategy_brain.settlement import (  # noqa: E402
     load_btc_price_points,
     load_resolution_cache,
+    load_official_resolutions,
     market_identity,
     settle_market,
 )
@@ -125,6 +126,7 @@ def sweep(
 
     existing = load_settlements(log_dir)
     resolution_cache = load_resolution_cache(log_dir)
+    official_store = load_official_resolutions(log_dir)
     price_points = load_btc_price_points(log_dir)
     if now_ts is None:
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -136,7 +138,13 @@ def sweep(
 
     for key, ident in markets.items():
         prior = existing.get(key)
-        if prior and prior.get("resolution_status") == "resolved" and not force:
+        prior_official = bool(
+            prior and prior.get("resolution_source") == OUTCOME_OFFICIAL)
+        if (prior and prior.get("resolution_status") == "resolved" and not force
+                and (prior_official or not official_store)):
+            # Keep official results; keep inferred results only when there is no
+            # official store that might upgrade them. Otherwise fall through and
+            # re-settle so an inferred outcome can be upgraded to official.
             skipped_resolved += 1
             source_counts[prior.get("resolution_source", OUTCOME_UNAVAILABLE)] += 1
             status_counts[prior.get("resolution_status")] += 1
@@ -144,6 +152,7 @@ def sweep(
         settlement = settle_market(
             ident,
             resolution_cache=resolution_cache,
+            official_store=official_store,
             price_points=price_points,
             now_ts=now_ts,
             official_only=official_only,

@@ -249,6 +249,27 @@ def infer_from_prices(
 # ---------------------------------------------------------------------------
 # Official resolution (offline, from the on-disk resolution cache)
 # ---------------------------------------------------------------------------
+def official_from_store(
+    identity: Dict[str, Any], official_store: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    """
+    Return a validated official outcome from the clean official-resolution store
+    (keyed by lower-cased condition id), or None. The store is produced by the
+    CLOB backfill and only contains condition-id-validated resolved markets.
+    """
+    if not official_store:
+        return None
+    cid = identity.get("condition_id")
+    if not cid:
+        return None
+    rec = official_store.get(str(cid).lower())
+    if isinstance(rec, dict) and rec.get("status") == "resolved":
+        outcome = rec.get("resolved_outcome")
+        if outcome:
+            return str(outcome).upper()
+    return None
+
+
 def official_from_cache(
     identity: Dict[str, Any], resolution_cache: Dict[str, Any]
 ) -> Optional[str]:
@@ -323,6 +344,7 @@ def settle_market(
     identity: Dict[str, Any],
     *,
     resolution_cache: Optional[Dict[str, Any]] = None,
+    official_store: Optional[Dict[str, Any]] = None,
     price_points: Optional[List[Dict[str, float]]] = None,
     now_ts: Optional[float] = None,
     official_only: bool = False,
@@ -370,8 +392,12 @@ def settle_market(
         base["reason"] = "market_not_finished"
         return base
 
-    # 1) Official resolution (authoritative).
-    official = official_from_cache(identity, resolution_cache)
+    # 1) Official resolution (authoritative). Prefer the clean, condition-id
+    #    validated official store (CLOB backfill) over the legacy on-disk
+    #    resolver cache (which historically contained wrong-market data).
+    official = official_from_store(identity, official_store) or official_from_cache(
+        identity, resolution_cache
+    )
     if official:
         base["resolved_outcome"] = official
         base["resolution_source"] = OUTCOME_OFFICIAL
@@ -428,6 +454,34 @@ def load_resolution_cache(log_dir: str = "logs") -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def load_official_resolutions(log_dir: str = "logs") -> Dict[str, Any]:
+    """
+    Load the clean official-resolution store (logs/official_resolutions.jsonl)
+    keyed by lower-cased condition id. Produced by the CLOB backfill tool; only
+    condition-id-validated records are present. Empty dict when absent.
+    """
+    path = Path(log_dir) / "official_resolutions.jsonl"
+    out: Dict[str, Any] = {}
+    if not path.exists():
+        return out
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cid = rec.get("requested_condition_id") or rec.get("condition_id")
+                if cid:
+                    out[str(cid).lower()] = rec
+    except Exception:
+        return {}
+    return out
 
 
 def load_btc_price_points(log_dir: str = "logs") -> List[Dict[str, float]]:

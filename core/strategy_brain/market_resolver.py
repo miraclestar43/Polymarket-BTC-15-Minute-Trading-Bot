@@ -26,6 +26,7 @@ from typing import Optional, Dict, Any
 
 
 _GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+_CLOB_API_BASE = "https://clob.polymarket.com"
 _RESOLUTION_CACHE_FILE = "logs/market_resolutions_cache.json"
 
 
@@ -150,6 +151,21 @@ class MarketResolver:
                 result["_cache_time"] = time.time()
                 return result
 
+            # Guard against the historical wrong-market bug: never trust a
+            # payload whose condition id does not match what we asked for.
+            # (Gamma's ?condition_id= param was silently ignored and returned
+            # an unrelated market; we now reject any mismatch outright.)
+            if condition_id:
+                returned_cid = market_data.get("conditionId") or market_data.get("condition_id")
+                if returned_cid and str(returned_cid).lower() != str(condition_id).lower():
+                    result["resolution_status"] = "unavailable"
+                    result["resolution_error"] = "condition_id_mismatch"
+                    result["_cache_time"] = time.time()
+                    self._api_cache[cache_key] = result
+                    self._disk_cache[cache_key] = result
+                    self._save_disk_cache()
+                    return result
+
             result["market_data"] = market_data
 
             # Check if market is resolved
@@ -207,9 +223,17 @@ class MarketResolver:
         condition_id: Optional[str] = None,
         slug: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Fetch market data from Gamma API."""
+        """
+        Fetch market data. Prefers the CLOB market endpoint, which reliably
+        returns the ephemeral 15-min BTC markets by condition id; falls back to
+        Gamma using the CORRECT plural ``condition_ids`` parameter (the old
+        singular ``condition_id`` was silently ignored by Gamma).
+        """
         if condition_id:
-            url = f"{_GAMMA_API_BASE}/markets?condition_id={condition_id}"
+            clob = self._fetch_market_clob(condition_id)
+            if clob is not None:
+                return clob
+            url = f"{_GAMMA_API_BASE}/markets?condition_ids={condition_id}"
         elif slug:
             url = f"{_GAMMA_API_BASE}/markets?slug={slug}"
         else:
@@ -223,6 +247,18 @@ class MarketResolver:
             if isinstance(data, list):
                 return data[0] if data else None
             return data
+
+    def _fetch_market_clob(self, condition_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a market from the CLOB endpoint by condition id (reliable for
+        15-min BTC markets). Returns None on any error so callers can fall back."""
+        url = f"{_CLOB_API_BASE}/markets/{condition_id}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "PolymarketBot/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            return data if isinstance(data, dict) and data.get("condition_id") else None
+        except Exception:
+            return None
 
 
 # Singleton
