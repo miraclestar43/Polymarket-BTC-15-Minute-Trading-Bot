@@ -140,6 +140,79 @@ def _check_diag_signals(chk: Check) -> None:
         chk.add("diagnostics installable", WARN, f"{type(e).__name__}")
 
 
+def _check_repo_and_venv(chk: Check) -> None:
+    # Confirm we operate on the expected repository and its virtualenv.
+    marker = PROJECT_ROOT / "15m_bot_runner.py"
+    chk.add("repository layout", PASS if marker.exists() else FAIL,
+            str(PROJECT_ROOT) if marker.exists() else "runner not found in this dir")
+    venv_py = PROJECT_ROOT / ".venv" / "bin" / "python"
+    using_venv = str(PROJECT_ROOT / ".venv") in str(Path(sys.executable).resolve())
+    chk.add("virtual environment", PASS if (using_venv or venv_py.exists()) else WARN,
+            "running under .venv" if using_venv else
+            (".venv present (run via .venv/bin/python)" if venv_py.exists()
+             else "no .venv detected"))
+
+
+def _check_disk_space(chk: Check, min_free_mb: int = 500) -> None:
+    try:
+        st = os.statvfs(PROJECT_ROOT / "logs")
+        free_mb = (st.f_bavail * st.f_frsize) / (1024 * 1024)
+        status = PASS if free_mb >= min_free_mb else (WARN if free_mb >= 100 else FAIL)
+        chk.add("disk space (logs partition)", status, f"{free_mb:.0f} MiB free")
+    except OSError as e:
+        chk.add("disk space (logs partition)", WARN, str(e))
+
+
+def _check_clock_sync(chk: Check) -> None:
+    # Read-only NTP/clock status via timedatectl; never adjusts the clock.
+    try:
+        out = subprocess.run(
+            ["timedatectl", "show", "--property=NTPSynchronized"],
+            capture_output=True, text=True, timeout=5)
+        txt = (out.stdout or "").strip()
+        synced = "NTPSynchronized=yes" in txt
+        chk.add("system clock NTP sync", PASS if synced else WARN,
+                "synchronized" if synced else "not synchronized / unknown")
+    except (OSError, subprocess.SubprocessError):
+        chk.add("system clock NTP sync", WARN, "timedatectl unavailable")
+
+
+def _check_dualbook_config(chk: Check) -> None:
+    try:
+        os.chdir(PROJECT_ROOT)
+        from config import load_strategy_config
+        cfg = load_strategy_config()
+        md = cfg.get("market_data") or {}
+        chk.add("dual-book config present", PASS if md else WARN,
+                "market_data section found" if md else "market_data section missing")
+        fresh = md.get("quote_freshness_seconds")
+        skew = md.get("cross_book_skew_warn_seconds")
+        ok = isinstance(fresh, (int, float)) and isinstance(skew, (int, float))
+        chk.add("quote freshness/skew config", PASS if ok else WARN,
+                f"freshness={fresh}s skew_warn={skew}s" if ok
+                else "freshness/skew thresholds not set")
+    except Exception as e:  # noqa: BLE001
+        chk.add("dual-book config", WARN, f"{type(e).__name__}")
+
+
+def _check_store_readable(chk: Check) -> None:
+    store = PROJECT_ROOT / "logs" / "official_resolutions.jsonl"
+    if not store.exists():
+        chk.add("official store readable", WARN, "absent (ok for a fresh run)")
+        return
+    try:
+        import json as _json
+        with open(store) as fh:
+            line = fh.readline().strip()
+        if line:
+            _json.loads(line)
+            chk.add("official store readable", PASS, "parses as JSONL")
+        else:
+            chk.add("official store readable", WARN, "empty")
+    except (OSError, ValueError) as e:
+        chk.add("official store readable", WARN, f"unreadable: {type(e).__name__}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="DRY-RUN preflight (read-only).")
     ap.add_argument("run_args", nargs="*",
@@ -149,9 +222,14 @@ def main(argv=None) -> int:
     chk = Check()
     _check_dry_run(chk)
     _check_no_live_flag(chk, args.run_args)
+    _check_repo_and_venv(chk)
     _check_dirs(chk)
+    _check_disk_space(chk)
     _check_data_files(chk)
+    _check_store_readable(chk)
+    _check_dualbook_config(chk)
     _check_dns(chk)
+    _check_clock_sync(chk)
     _check_service(chk)
     _check_diag_signals(chk)
 
