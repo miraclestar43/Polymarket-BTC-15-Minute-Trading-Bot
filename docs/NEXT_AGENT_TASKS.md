@@ -24,8 +24,9 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
 
 ## 2. Exact current HEAD
 
-- Branch `main`, HEAD `__FINAL_HEAD__` (see `polymarket-final-manifest.txt`).
-  Pre-task HEAD was `8e47b76`. Commits are **not pushed**.
+- Branch `main`, HEAD `73c0f61` or its child doc-stamp (the exact final HEAD is
+  recorded in `polymarket-final-manifest.txt`). Pre-task HEAD was `8e47b76`.
+  Commits are **not pushed**.
 
 ## 3. Valid vs invalid historical conclusions
 
