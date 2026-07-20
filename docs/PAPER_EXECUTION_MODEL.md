@@ -121,3 +121,19 @@ current BTC 15m market, subscribes to both books, and proves a **real NO ask**
 is obtainable. A live run captured `no_ask` with both books `ok` and all
 validation flags healthy — closing the capability gap that made SHORT
 economics unavailable.
+
+## 10. Observed in the full runner (2026-07-19/20)
+
+A 4-hour full run confirmed the model live (`scripts/dual_book_run_audit.py`):
+
+- Both books `ok` for 100% of 240 records; all 98 short-side evaluations priced
+  off the **NO ask**, all 126 long-side off the **YES ask**.
+- **Every paper fill was L1 (`depth_level_count`=1).** The live Nautilus feed is
+  top-of-book only, so multi-level VWAP was **not** observed live even though it
+  is implemented and unit-tested. Fills consumed only the observed top level; a
+  stake exceeding top-level size would be a labelled partial fill (none this run).
+- All fills were **`pre_fee`** (no fee rate exposed). Treat every economic figure
+  as pre-fee.
+- The forensic CSV records `depth_source`, `depth_level_count`, `l1_limited` and
+  `stake_exceeded_top_level` per fill so the L1 limitation is explicit, never
+  implied away.

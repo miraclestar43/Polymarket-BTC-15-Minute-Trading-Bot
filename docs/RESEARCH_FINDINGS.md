@@ -121,3 +121,25 @@ This is an **instrumentation** fix, not a new edge: strategy logic is unchanged
 and no forward economic run was collected in this session. A fresh DRY-RUN is
 still required to accumulate executable SHORT economics before any conclusion.
 See [PAPER_EXECUTION_MODEL.md](PAPER_EXECUTION_MODEL.md).
+
+## 9. Full-runner dual-book audit (2026-07-19/20)
+
+Window `2026-07-19T21:16:00Z → 2026-07-20T01:16:10Z` (runner_start pid 17409),
+4.00h, 0 watchdog restarts. 240 records / 16 markets; both books `ok` for 100%;
+quote ages median ~0.23s (all < 60s); skew max 0.107s; 0 stale/skew/spread/crossed.
+
+- **Dual-book pricing verified live in the real runner:** all 98 short-side
+  evaluations priced off the **NO ask** (0 off the YES midpoint, selected_token==
+  no_token 98/98); all 126 long-side evaluations used the **YES ask**.
+- 16 would-trades, **all LONG** (up-trending window); all 11 forensic proof
+  checks pass (`logs/dual_book_run_forensic.csv`).
+- Settlement 4/4 markets resolved (3 UP, 1 DOWN), hardened parser.
+- **View B executable economics (pre-fee, $1 risk): net negative, tiny n.** Entry
+  prices 0.90–0.996 → wins pay pennies, a loss costs the whole stake. **No edge
+  claimed** — descriptive statistics with Wilson CIs only.
+- **L1 limitation:** live feed top-of-book only; multi-level VWAP not observed
+  live; no depth fabricated. **Fees:** none exposed → all numbers **pre-fee**.
+
+Conclusion unchanged: only directional mapping and capture correctness are
+established. No economic edge. A 5–7 day dry-run is required (see
+[NEXT_AGENT_TASKS.md](NEXT_AGENT_TASKS.md)).

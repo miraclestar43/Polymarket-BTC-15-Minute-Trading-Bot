@@ -102,10 +102,23 @@ Backs up the store to `official_resolutions.jsonl.backup-<ts>`, re-fetches every
 condition id with the hardened parser, and replaces the active store only when
 no mismatch/regression is found. A network failure leaves the store intact.
 
+## 6d. Full-runner dual-book audit (read-only)
+
+```bash
+# audit every would-trade record in an explicit run window (from runner_events.jsonl)
+.venv/bin/python scripts/dual_book_run_audit.py \
+  --since 2026-07-19T21:16:00Z --until 2026-07-20T01:16:11Z
+```
+
+Proves per record that SHORT priced off the NO ask / LONG off the YES ask, quote
+freshness/skew/spread, book generation, market identity and paper-fill L1 depth.
+Writes `logs/dual_book_run_forensic.csv` + `logs/dual_book_run_audit.json`.
+Official outcomes are fetched read-only; deeper liquidity is never fabricated.
+
 ## 7. Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # expect 306 passed
+.venv/bin/python -m pytest tests/ -q     # expect 314 passed
 ```
 
 ## 7b. Watchdog startup false-positive (fixed 2026-07-19)

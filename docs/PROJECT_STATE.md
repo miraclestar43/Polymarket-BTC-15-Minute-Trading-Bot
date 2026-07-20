@@ -1,8 +1,8 @@
 # PROJECT STATE
 
-_Last updated: 2026-07-19 (final handoff session). DRY-RUN ONLY._
+_Last updated: 2026-07-20 (dual-book full-run audit + final backup). DRY-RUN ONLY._
 
-_Handoff content HEAD: 983698141270f2e4946253b04507aa6ffb22a1da (this doc-stamp commit is its child). Exact final HEAD is recorded in polymarket-final-handoff.manifest.txt._
+_Exact final HEAD is recorded in polymarket-final-manifest.txt._
 
 ## What this project is
 
@@ -104,6 +104,35 @@ logic changed (Kelly/Markov/thresholds/side/sizing/probabilities untouched);
   only on full validation).
 - **Tests:** full suite **306 passed** (263 baseline + 43 new deterministic
   tests); preflight **OK**.
+
+## Full-runner dual-book audit (2026-07-19/20)
+
+A full 4-hour dry-run then exercised the dual-book code in the real runner and
+was audited end-to-end (`scripts/dual_book_run_audit.py`).
+
+- **Window:** `2026-07-19T21:16:00Z → 2026-07-20T01:16:10Z` (runner_start pid
+  17409, `bot_args=[]`), 4.00h, 3 children (2 planned ~90-min restarts),
+  **0 watchdog restarts** — the startup-heartbeat fix held (no false positive).
+- **Dual-book capture:** 240 records / 16 markets, **both books `ok` for 100%**,
+  NO/YES quote-age median ~0.23s (max 2.5s, all < 60s), skew max 0.107s,
+  **0 stale / 0 skew / 0 spread / 0 crossed**.
+- **Pricing proof:** 16 would-trades all **LONG**, each using the **YES ask**
+  (16/16, all 11 forensic proof checks pass). No SHORT would-trades, but **all 98
+  short-side evaluations priced off the NO ask** (0 off the YES midpoint).
+- **Settlement:** 4/4 would-trade markets officially resolved (3 UP, 1 DOWN),
+  hardened parser, cid match, single winner; appended to the official store
+  (backup kept).
+- **Economics (view B, $1 fixed risk, pre-fee):** net negative, tiny n — entry
+  0.90–0.996 so wins pay pennies vs a full-stake loss. **No edge; descriptive.**
+- **L1 limitation:** live feed is top-of-book only (`depth_level_count`=1 for all
+  fills); multi-level VWAP not observed live; no fabricated depth.
+- **Preflight hardened:** added disk-space, NTP clock-sync, repo/venv, dual-book
+  config, freshness/skew, and store-readability checks — all PASS.
+- **Tests:** full suite **314 passed** (+8 audit/preflight regression tests);
+  synthetic stall smoke test **PASS**.
+- Artifacts: `logs/dual_book_run_forensic.csv`, `logs/dual_book_run_audit.json`;
+  backups `polymarket-final-code.bundle` + `polymarket-final-data.tar.gz` +
+  `polymarket-final-manifest.txt`.
 
 ## Headline finding (CRITICAL)
 
