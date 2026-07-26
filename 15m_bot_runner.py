@@ -22,6 +22,8 @@ from typing import Optional
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+from core.diagnostics import run_provenance  # noqa: E402
+
 # Watchdog configuration
 HEARTBEAT_FILE = "logs/bot_heartbeat.json"
 JOURNAL_DIR = "logs"
@@ -411,6 +413,28 @@ def run_bot():
     python_cmd = sys.executable
     bot_args = sys.argv[1:] if len(sys.argv) > 1 else []
 
+    # --- Run provenance (computed ONCE here, never per child/record) ---
+    runner_start_ts = time.time()
+    dry_run = "--live" not in bot_args
+    live_trading_ack = os.getenv("LIVE_TRADING_ACK", "").lower() == "true"
+    try:
+        from core.strategy_brain.shadow_evaluator import SHADOW_SCHEMA_VERSION as _schema_version
+    except Exception:
+        _schema_version = None
+    provenance = run_provenance.compute_provenance(
+        repo_root=project_root,
+        bot_args=bot_args,
+        dry_run=dry_run,
+        live_trading_ack=live_trading_ack,
+        runner_pid=os.getpid(),
+        runner_start_ts=runner_start_ts,
+        schema_version=_schema_version,
+    )
+    manifest_path = run_provenance.write_start_manifest(project_root, provenance)
+    _git = provenance["git"]
+    _head_short = _git["head"][:12] if _git["head"] != run_provenance.UNAVAILABLE else run_provenance.UNAVAILABLE
+    child_env = {**os.environ, **run_provenance.env_for_child(provenance)}
+
     print("=" * 80)
     print("BTC 15-MIN TRADING BOT - AUTO-RESTART WRAPPER")
     print("=" * 80)
@@ -420,6 +444,9 @@ def run_bot():
     print(f"Bot arguments: {bot_args}")
     print(f"Virtual env: {sys.prefix}")
     print(f"Watchdog: ENABLED (stale threshold: {STALE_THRESHOLD_SECONDS}s)")
+    print(f"Run provenance: run_id={provenance['run_id']} git_head={_head_short} "
+          f"dirty={_git['dirty']} dry_run={dry_run}")
+    print(f"Run manifest: {manifest_path}")
     print("=" * 80)
     print()
 
@@ -436,6 +463,14 @@ def run_bot():
     # Tracks the currently-running child so the shutdown path can terminate it
     # gracefully and log a child_exit even when interrupted by a signal.
     active_child = {"process": None, "start_ts": None, "restart_index": 0}
+
+    # Running lifecycle totals for this run session, folded into the end
+    # manifest at shutdown (a dict, not locals, so both the main loop and
+    # the nested _shutdown_child() below can update it without `nonlocal`).
+    lifecycle_counts = {
+        "child_start": 0, "child_exit": 0,
+        "clean_exit": 0, "watchdog_restart": 0,
+    }
 
     def _shutdown_child() -> None:
         """Terminate the running child gracefully and log its child_exit."""
@@ -466,6 +501,7 @@ def run_bot():
             watchdog_triggered=False,
             classification="runner_shutdown",
         )
+        lifecycle_counts["child_exit"] += 1
         active_child["process"] = None
         current_child_pid[0] = None
 
@@ -494,7 +530,7 @@ def run_bot():
 
             try:
                 cmd = [python_cmd, BOT_SCRIPT] + bot_args
-                process = subprocess.Popen(cmd)
+                process = subprocess.Popen(cmd, env=child_env)
                 current_child_pid[0] = process.pid
                 print(f"[RUNNER] Child PID: {process.pid}")
 
@@ -507,6 +543,7 @@ def run_bot():
                     child_pid=process.pid,
                     restart_index=restart_count,
                 )
+                lifecycle_counts["child_start"] += 1
 
                 exit_code = process.wait()
                 active_child["process"] = None
@@ -533,6 +570,11 @@ def run_bot():
                     watchdog_reason=watchdog.last_restart.get("reason") if watchdog_triggered else None,
                     classification=classification,
                 )
+                lifecycle_counts["child_exit"] += 1
+                if classification == "clean_exit":
+                    lifecycle_counts["clean_exit"] += 1
+                elif classification == "watchdog_restart":
+                    lifecycle_counts["watchdog_restart"] += 1
 
                 print()
                 print("=" * 80)
@@ -589,6 +631,19 @@ def run_bot():
             pid=os.getpid(),
             signal=_signal_name(shutdown_signal),
         )
+        try:
+            run_provenance.write_end_manifest(
+                repo_root=project_root,
+                run_id=provenance["run_id"],
+                stop_reason=_signal_name(shutdown_signal) or "unknown",
+                child_start_count=lifecycle_counts["child_start"],
+                child_exit_count=lifecycle_counts["child_exit"],
+                clean_exit_count=lifecycle_counts["clean_exit"],
+                watchdog_restart_count=lifecycle_counts["watchdog_restart"],
+                runner_start_ts=runner_start_ts,
+            )
+        except Exception as e:
+            print(f"[RUNNER] Failed to write end manifest: {e}")
 
 if __name__ == "__main__":
     try:

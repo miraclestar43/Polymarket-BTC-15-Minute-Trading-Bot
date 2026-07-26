@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from core.strategy_brain import paper_execution
+from core.diagnostics import run_provenance
 
 
 # Built-in shadow configuration variants. These are diagnostic-only and never
@@ -81,6 +82,21 @@ _SHADOW_CONFIG_FILE = "shadow_experiments.yaml"
 # guessing which token a price refers to. Bumping this NEVER changes signal or
 # selection logic.
 SHADOW_SCHEMA_VERSION = 2
+
+
+def _run_provenance_fields() -> Dict[str, Any]:
+    """Run-provenance fields merged into every shadow record: run_id,
+    git_head, git_branch, git_dirty, strategy_config_sha256. Reads the
+    already-computed values cached by run_provenance.get_current_run_provenance()
+    (env vars set once by the runner) — no Git call, no file hash here."""
+    p = run_provenance.get_current_run_provenance()
+    return {
+        "run_id": p["run_id"],
+        "git_head": p["git_head"],
+        "git_branch": p["git_branch"],
+        "git_dirty": p["git_dirty"],
+        "strategy_config_sha256": p["strategy_config_sha256"],
+    }
 
 
 def _forward_schema_fields(
@@ -620,6 +636,12 @@ class ShadowEvaluator:
             "shadow_skip_reason": shadow_skip_reason,
             "dry_run": True,
             "simulation": True,
+            # Run provenance (computed once by the runner at startup, read
+            # here from env vars set for this child — never a Git call or a
+            # file hash per record). Lets a future audit prove which code
+            # version produced this record instead of inferring it from
+            # wall-clock time, per the 2026-07-20..27 closeout finding.
+            **_run_provenance_fields(),
             **forward,
         }
 
