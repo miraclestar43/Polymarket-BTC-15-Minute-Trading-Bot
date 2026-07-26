@@ -512,9 +512,21 @@ class ShadowEvaluator:
             fee_aware_ev = kwargs["kelly_raw"] - kwargs["fee_estimate"]
             fee_aware_passed = fee_aware_ev > 0
 
-        # Final decision
+        # Final decision. `has_valid_side` is required in addition to the
+        # per-gate checks below: the skip_kelly / kelly_min_raw relaxed paths
+        # above only verify `shadow_direction != "blocked_by_direction"`, so
+        # when the REAL signal was neutral (direction="unknown", passed in by
+        # bot.py when neither BULLISH nor BEARISH), a stale/persisted Markov
+        # p_stay from a PRIOR cycle could still satisfy markov_passed_shadow
+        # and (with Kelly relaxed/skipped) kelly_passed_shadow, flagging
+        # would_trade=True with no side to trade (selected_token_id stays
+        # null downstream). Proven in the 2026-07-20..27 collection run: 48
+        # such records, confined to shadow_no_kelly / shadow_allow_kelly_*
+        # / relaxed_markov_and_kelly_shadow. This gate closes that forward
+        # only; it does not reinterpret or rewrite any historical record.
+        has_valid_side = shadow_direction in ("long", "short")
         would_trade = (
-            shadow_direction != "blocked_by_direction"
+            has_valid_side
             and not trend_guard_block
             and markov_passed_shadow
             and kelly_passed_shadow
@@ -527,6 +539,8 @@ class ShadowEvaluator:
         if not would_trade:
             if shadow_direction == "blocked_by_direction":
                 shadow_skip_reason = f"direction_blocked: {name}"
+            elif not has_valid_side:
+                shadow_skip_reason = f"no_valid_side: actual_direction={actual_direction}"
             elif trend_guard_block:
                 shadow_skip_reason = f"trend_guard_block: entry={kwargs.get('entry_price')}"
             elif not markov_passed_shadow:
