@@ -13,7 +13,13 @@ Checks:
   * key data files present with a recognisable schema,
   * network/DNS reachability of the CLOB host (DNS only — no API call),
   * safety service state (polymarket-dryrun.service) reported (not started),
-  * diagnostic signal readiness (SIGUSR1/SIGUSR2 installable).
+  * diagnostic signal readiness (SIGUSR1/SIGUSR2 installable),
+  * Git HEAD + working-tree cleanliness (report-only unless
+    `--require-clean-git`, which turns a dirty tree into a blocking FAIL —
+    for a replication run that must run one fixed commit start-to-finish),
+  * required config hashes (strategy.yaml, requirements.txt) present,
+  * no other `15m_bot_runner.py` process already running,
+  * no `polymarket-collection-*.service` already active.
 
 Exit 0 = safe to proceed. Non-zero = at least one blocking check failed.
 """
@@ -28,6 +34,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from core.diagnostics import run_provenance as _rp  # noqa: E402
 
 CLOB_HOST = "clob.polymarket.com"
 REQUIRED_DIRS = ["logs", "logs/diagnostics"]
@@ -213,16 +221,92 @@ def _check_store_readable(chk: Check) -> None:
         chk.add("official store readable", WARN, f"unreadable: {type(e).__name__}")
 
 
+def _check_git_state(chk: Check, require_clean: bool) -> None:
+    # Local-only (no fetch/pull/ls-remote) — same helper the runner uses to
+    # compute run provenance, so preflight and the actual run agree.
+    info = _rp.compute_git_info(PROJECT_ROOT)
+    head = info["head"]
+    if head == _rp.UNAVAILABLE:
+        chk.add("git HEAD", WARN, "git unavailable or not a repository")
+        chk.add("working tree clean", WARN, "could not determine (git unavailable)")
+        return
+    chk.add("git HEAD", PASS, f"{head[:12]} (branch {info['branch']})")
+    dirty = info["dirty"]
+    if dirty is True:
+        msg = ("uncommitted changes present — a replication run must execute "
+               "one fixed commit for its entire duration")
+        if require_clean:
+            chk.add("working tree clean", FAIL, msg + " (--require-clean-git)")
+        else:
+            chk.add("working tree clean", WARN, msg)
+    else:
+        chk.add("working tree clean", PASS, "no uncommitted changes")
+
+
+def _check_config_hashes(chk: Check) -> None:
+    strategy_hash = _rp.sha256_file(PROJECT_ROOT / "strategy.yaml")
+    chk.add("strategy.yaml hash", PASS if strategy_hash else WARN,
+            strategy_hash[:16] + "…" if strategy_hash else "strategy.yaml not found")
+    req_hash = _rp.sha256_file(PROJECT_ROOT / "requirements.txt")
+    chk.add("requirements.txt hash", PASS if req_hash else WARN,
+            req_hash[:16] + "…" if req_hash else "requirements.txt not found")
+
+
+def _check_no_competing_runner(chk: Check) -> None:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", "15m_bot_runner.py"],
+            capture_output=True, text=True, timeout=5)
+        # Exclude nothing special: pgrep only matches processes whose cmdline
+        # contains the pattern, and this preflight script's own cmdline does
+        # not, so no self-match is possible.
+        lines = [l for l in out.stdout.splitlines() if l.strip()]
+        if lines:
+            pids = ", ".join(l.split()[0] for l in lines)
+            chk.add("no competing runner", WARN,
+                    f"15m_bot_runner.py already running (pid(s): {pids})")
+        else:
+            chk.add("no competing runner", PASS, "no other 15m_bot_runner.py process")
+    except (OSError, subprocess.SubprocessError):
+        chk.add("no competing runner", WARN, "pgrep unavailable")
+
+
+def _check_collection_service_inactive(chk: Check) -> None:
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "--all",
+             "--no-legend", "--plain", "polymarket-collection-*.service"],
+            capture_output=True, text=True, timeout=5)
+        active = [l for l in out.stdout.splitlines() if " active " in f" {l} "]
+        if active:
+            chk.add("collection service not already active", WARN,
+                    "; ".join(l.split()[0] for l in active))
+        else:
+            chk.add("collection service not already active", PASS,
+                    "no polymarket-collection-*.service currently active")
+    except (OSError, subprocess.SubprocessError):
+        chk.add("collection service not already active", WARN, "systemctl unavailable")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="DRY-RUN preflight (read-only).")
     ap.add_argument("run_args", nargs="*",
                     help="the args you intend to pass to 15m_bot_runner.py")
+    ap.add_argument("--require-clean-git", action="store_true",
+                    help="fail (not just warn) if the working tree has "
+                         "uncommitted changes — use before starting a "
+                         "replication run that must execute one fixed "
+                         "commit for its entire 7-day duration.")
     args = ap.parse_args(argv)
 
     chk = Check()
     _check_dry_run(chk)
     _check_no_live_flag(chk, args.run_args)
     _check_repo_and_venv(chk)
+    _check_git_state(chk, args.require_clean_git)
+    _check_config_hashes(chk)
+    _check_no_competing_runner(chk)
+    _check_collection_service_inactive(chk)
     _check_dirs(chk)
     _check_disk_space(chk)
     _check_data_files(chk)
