@@ -24,9 +24,11 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
 
 ## 2. Exact current HEAD
 
-- Branch `main`, HEAD `73c0f61` or its child doc-stamp (the exact final HEAD is
-  recorded in `polymarket-final-manifest.txt`). Pre-task HEAD was `8e47b76`.
-  Commits are **not pushed**.
+- Branch `main`. The exact final HEAD after the 2026-07-26 closeout (audit
+  tooling, 3 bug fixes, tests, docs) is recorded in
+  `/home/star/polymarket-7d-final-manifest.txt`. Pre-closeout HEAD was
+  `4c9da8d`. Commits are **not pushed** — the exact push command is in that
+  manifest, not executed.
 
 ## 3. Valid vs invalid historical conclusions
 
@@ -37,34 +39,38 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
   SHORT payouts. Historical executable SHORT economics are **not recoverable**
   (no NO quote/timestamp was stored) and must stay reported as *unavailable*.
 
-## 4. Result of the new full-run dual-book audit (2026-07-19/20)
+## 4. Result of the FINAL 7-day closeout (2026-07-20 → 2026-07-26)
 
-- Window: `2026-07-19T21:16:00Z → 2026-07-20T01:16:10Z` (runner_start pid 17409,
-  `bot_args=[]`), 4.00h, 3 children (2 planned ~90-min restarts), **0 watchdog
-  restarts**.
-- 240 shadow records over 16 markets; **both books `ok` for 100%** of records;
-  NO/YES quote ages median ~0.23s (max 2.5s, all < 60s); cross-book skew max
-  0.107s; **0 stale / 0 skew / 0 spread / 0 crossed** warnings.
-- 16 would-trade decisions, **all LONG** (the window trended up); every LONG used
-  the YES ask (16/16). No SHORT would-trades occurred, but **all 98 short-side
-  evaluations priced off the NO ask** (0 off the YES midpoint) — the SHORT path is
-  proven wired.
-- Settlement: all 4 would-trade markets officially resolved (3 UP, 1 DOWN),
-  hardened parser, cid match, single winner. Directional wins 3/16 (the single
-  high-conviction cycle that all configs took resolved DOWN).
-- Executable economics (view B, $1 fixed risk, pre-fee): net **negative and tiny
-  n** — entry prices were 0.90–0.996 so wins pay pennies while a loss costs the
-  full stake. **No edge; descriptive only.**
-- Forensic CSV: `logs/dual_book_run_forensic.csv`; summary
-  `logs/dual_book_run_audit.json`.
+- Window: `2026-07-20T04:17:10.903548Z → 2026-07-26T16:23:41.723Z`
+  (runner_start pid 19538, `bot_args=[]`), ~6.46 of the intended 7 days,
+  frozen at the operator's explicit direction (service was not stopped).
+  Frozen scoped snapshot + hashes: `/home/star/polymarket-7d-final-audit/`.
+- 105 child cycles (102 clean ~90-min restarts, **2 watchdog restarts**, both
+  root-caused and fixed — see §12 below). 8,895 schema-v2 records, 930
+  would_trade rows, both books valid 99.0%, LONG (351 filled) 100% off the
+  YES ask, SHORT (480 filled) 100% off the NO ask, official settlement
+  coverage 930/930 at fetch time.
+- Directional (Wilson 95% CI): baseline n=36, 75.0% [58.9%, 86.3%];
+  shadow_no_kelly n=367, 92.9% [89.8%, 95.1%].
+- Executable economics (View B, $1 fixed risk, pre-fee): baseline net
+  **+$4.09**, ROR **11.4%**, stays positive through a hypothetical 2% fee
+  (9.4%). shadow_no_kelly net +$8.29, ROR 2.3%, collapsing to 0.3% at a
+  hypothetical 2% fee. **shadow_no_kelly's incremental P/L over baseline,
+  bootstrapped with market-clustered resampling, has a 95% CI of
+  [-0.015, +0.036] per trade — crosses zero.** LONG outperforms SHORT in
+  every variant checked (baseline ROR 23.0% vs 4.0%).
+- Full detail (per-variant tables, fee sweep, paired comparisons, day-by-day
+  P/L, calibration bins): `RESEARCH_FINDINGS.md` §10.
+- **No strategy edge is established. No variant meets the §8 evidence bar.**
 
 ## 5. Remaining L1 depth limitation
 
-- The live Nautilus quote feed is **top-of-book (L1) only**: `depth_level_count`
-  was 1 for every fill. Multi-level VWAP is supported and unit-tested but was
-  **not observed live**. Fills use only the observed top level; deeper liquidity
-  is never fabricated. A stake exceeding top-level size yields a labelled partial
-  fill (0 occurred this run).
+- The live Nautilus quote feed is **top-of-book (L1) only**. Across the full
+  7-day closeout (831 valid-executable fills), exactly **one** real partial
+  fill occurred (2026-07-25, LONG, requested 1.136 shares vs 0.74 observed
+  top-of-book size) — the first live confirmation of the `stake_exceeded_top_level`
+  path. Multi-level VWAP remains implemented/unit-tested but not observed
+  live. Deeper liquidity is never fabricated.
 
 ## 6. Fee limitation
 
@@ -72,17 +78,61 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
   **`pre_fee`** (`fee_rate=None`). All economic numbers are **pre-fee**; real net
   P/L will be lower. Do not present pre-fee numbers as net-of-fee.
 
-## 7. Recommended 5–7 day dry-run
+## 7. Recommended NEXT experiment (single, primary — see Phase 10 rationale)
+
+**Do not change strategy logic for this next run.** The single most
+scientifically load-bearing next step is a **second, independent, unmodified
+7-day DRY-RUN window** — a true out-of-sample replication, not a new
+variant:
+
+- **Hypothesis:** baseline's week-1 pre-fee executable ROR (+11.4%,
+  directional accuracy 75.0%) and its LONG≫SHORT asymmetry (23.0% vs 4.0%
+  ROR) replicate in an independent week.
+- **Control:** current baseline parameters, unchanged (this is a replication
+  run, not a treatment).
+- **Treatment:** none — no Kelly/Markov/threshold/side/sizing change.
+- **Metrics:** per-variant directional accuracy + Wilson CI; View-B pre-fee
+  AND fee-swept (0/0.25/0.5/1/2%) ROR; paired bootstrap incremental P/L vs
+  baseline clustered by `condition_id`; day-by-day cumulative P/L; entry-price
+  concentration — identical methodology to `RESEARCH_FINDINGS.md` §10 so the
+  two windows are directly comparable.
+- **Minimum sample:** ≥300 resolved valid-executable decisions for
+  `shadow_no_kelly` (the highest-n variant) pooled across both weeks before
+  any edge claim; ≥60 for baseline/long_only/short_only individually
+  (double week 1) as an interim checkpoint.
+- **Stop criteria:** run the full 7 days unattended, exactly like week 1. Do
+  **not** stop early on interim P/L (avoids early-stopping/p-hacking bias);
+  the only valid early-stop reasons are the same safety/data-integrity
+  defects that would justify stopping any run.
+- **Out-of-sample requirement:** week 2 IS the out-of-sample test of week 1's
+  findings — do not draw a conclusion from week 1 alone (already true here).
+- **Decision rule after week 2:** only consider a strategy-parameter change
+  if, pooling weeks 1+2, a variant has (a) ≥300 resolved valid-executable
+  decisions, (b) directional Wilson CI excluding 0.5, (c) View-B ROR positive
+  after a conservative 1% fee assumption, **and** (d) week 2 directionally
+  replicates week 1 (same sign of ROR, LONG still ≥ SHORT). If any condition
+  fails, run a third window rather than changing strategy. **Live trading
+  remains NOT APPROVED regardless of outcome** — that requires a separate,
+  explicit, human-reviewed decision outside this research loop.
+
+Exact command (NOT executed by this closeout — run only after human
+approval; uses a fresh unit name so it cannot collide with the still-running
+week-1 unit):
 
 ```bash
 cd /home/star/polymarket-BTC-15-Minute-Trading-Bot
 .venv/bin/python scripts/preflight_dryrun.py          # expect RESULT: OK
-DRY_RUN=true LIVE_TRADING_ACK=false \
-  nohup .venv/bin/python 15m_bot_runner.py > logs/dryrun_$(date -u +%Y%m%dT%H%M%SZ).log 2>&1 &
-# let it run 5–7 days (self-restarts clean children ~every 90 min)
+systemd-run --user --unit=polymarket-collection-7d-w2.service \
+  --working-directory=/home/star/polymarket-BTC-15-Minute-Trading-Bot \
+  --property=RuntimeMaxSec=7d \
+  /home/star/polymarket-BTC-15-Minute-Trading-Bot/.venv/bin/python \
+  /home/star/polymarket-BTC-15-Minute-Trading-Bot/15m_bot_runner.py
+# let it run the full 7 days (self-restarts clean children ~every 90 min)
 ```
-Stop: `pkill -TERM -f 15m_bot_runner.py`.
-Audit afterwards with the exact window from `logs/runner_events.jsonl`:
+Stop (only if ever needed, and only with approval):
+`systemctl --user stop polymarket-collection-7d-w2.service`.
+Audit afterwards with the exact window from `logs/runner_events.jsonl`
+(never `--latest-run` without first proving it matches):
 ```bash
 .venv/bin/python scripts/dual_book_run_audit.py --since <ISO> --until <ISO>
 ```
@@ -103,6 +153,25 @@ Audit afterwards with the exact window from `logs/runner_events.jsonl`:
   `LIVE_TRADING_ACK=true`; never enable/start `polymarket-dryrun.service` for
   live mode; never touch order-submission code. No economic edge has been
   established.
+
+## 12. Three proven, fixed, non-strategy defects (2026-07-26 closeout)
+
+1. **Unknown-side would_trade** (`core/strategy_brain/shadow_evaluator.py`):
+   the 4 Kelly-relaxed variants could set `would_trade=true` with
+   `shadow_side="unknown"` (no side, no price). Never affected economics
+   (already excluded downstream); fixed forward with a `has_valid_side` gate.
+   Tests: `tests/test_shadow_unknown_side_no_trade.py`.
+2. **Execution reconciliation stall** (`bot.py` / vendored `nautilus_trader`):
+   a transient exchange disconnect during startup reconciliation aborted the
+   whole bot startup, causing a ~45-minute inert stall recovered only by the
+   watchdog (2/105 child cycles). Fixed by skipping reconciliation while
+   `DRY_RUN=true`. Tests: `tests/test_reconciliation_dry_run_gate.py`.
+3. **Cosmetic `[LIVE]` log label** (`execution/execution_engine.py`): fixed to
+   read the effective `self.dry_run` instead of the raw constructor arg.
+   Tests: `tests/test_execution_engine_mode_label.py`.
+
+None of these changed Kelly, Markov, thresholds, side selection, model
+probabilities, or sizing. Full pytest suite: 325 passed (was 314).
 
 ## 10. Exact Hermes read-only monitoring commands
 

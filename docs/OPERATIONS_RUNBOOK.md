@@ -118,8 +118,24 @@ Official outcomes are fetched read-only; deeper liquidity is never fabricated.
 ## 7. Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # expect 314 passed
+.venv/bin/python -m pytest tests/ -q     # expect 325 passed (2026-07-26 closeout)
 ```
+
+## 7c. DRY-RUN skips execution-state reconciliation (fixed 2026-07-26)
+
+Two watchdog restarts in the 2026-07-20..27 collection run were traced to
+Nautilus's `SystemKernel.start_async()` aborting startup (never calling
+`self._trader.start()`, so no subscriptions/heartbeat ever happen) after a
+transient `httpcore.RemoteProtocolError("Server disconnected")` during
+startup execution-state reconciliation — the process then sat inert for
+~45 minutes until the watchdog's heartbeat-staleness check killed it.
+`bot.py` now passes `reconciliation=not simulation` to `LiveExecEngineConfig`:
+reconciling real exchange order/fill state is meaningless while
+`DRY_RUN=true` (no real order is ever placed), so the vulnerable path is
+skipped entirely in dry-run. A live run (`simulation=False`, not approved)
+keeps the safe `reconciliation=True` default unchanged. The watchdog is
+unchanged and remains the safety net for any other stall.
+See `tests/test_reconciliation_dry_run_gate.py`.
 
 ## 7b. Watchdog startup false-positive (fixed 2026-07-19)
 

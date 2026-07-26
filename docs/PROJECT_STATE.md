@@ -1,8 +1,8 @@
 # PROJECT STATE
 
-_Last updated: 2026-07-20 (dual-book full-run audit + final backup). DRY-RUN ONLY._
+_Last updated: 2026-07-26 (final 7-day DRY-RUN closeout audit). DRY-RUN ONLY._
 
-_Exact final HEAD is recorded in polymarket-final-manifest.txt._
+_Exact final HEAD is recorded in /home/star/polymarket-7d-final-manifest.txt._
 
 ## What this project is
 
@@ -16,6 +16,75 @@ live orders** while `DRY_RUN=true` / `LIVE_TRADING_ACK=false`.
 - `LIVE_TRADING_ACK=false` (only ever read from `.env`, never from YAML).
 - `polymarket-dryrun.service` is **inactive/disabled** — untouched this session.
 - No live order path is enabled.
+- **Live trading remains NOT APPROVED** — see the 7-day closeout below.
+
+## Final 7-day closeout (runner_start 2026-07-20T04:17:10.903548Z, PID 19538)
+
+Frozen analysis snapshot under `/home/star/polymarket-7d-final-audit/`
+(`manifest.txt` has SHA256 hashes of every scoped source file). The
+collection service (`polymarket-collection-7d.service`) was still active at
+the moment this snapshot was frozen — analysis is scoped to
+`[2026-07-20T04:17:10.903548Z, 2026-07-26T16:23:41.723Z]` (~6.46 of the
+intended 7 days) at the operator's explicit direction; the service itself was
+never stopped, restarted, or signalled by this audit.
+
+- **Lifecycle:** 105 child_start / 104 child_exit, 102 clean (`exit_code=0`,
+  ~90 min each), **2 watchdog restarts** (both `heartbeat_stale`, both
+  root-caused to the same trigger — see §"Reconciliation stall" below), 0
+  nonzero exits, 0 competing runners, `DRY_RUN=true`/`LIVE_TRADING_ACK=false`
+  logged at all 105 child startups, 0 `--live`.
+- **Schema-v2 completeness:** 8,895 records, 100% `schema_version=2`, 0 v1, 0
+  malformed. 930 would_trade rows; both books valid for 8,805/8,895 (99.0%);
+  LONG (351 filled) proven 100% off the YES ask, SHORT (480 filled) proven
+  100% off the NO ask — 0 YES-midpoint-as-NO substitutions across the run.
+  Official settlement coverage 930/930 (100%) as of the snapshot fetch.
+- **Unknown-side would_trade bug (found, root-caused, forward-fixed):** 96 of
+  the 930 would_trade rows had `shadow_side="unknown"` (no side, no selected
+  token), confined to the 4 Kelly-relaxed variants
+  (`shadow_no_kelly`, `shadow_allow_kelly_minus_002/005`,
+  `relaxed_markov_and_kelly_shadow`). Root cause:
+  `core/strategy_brain/shadow_evaluator.py` only gated those variants' Kelly
+  check on `shadow_direction != "blocked_by_direction"`, not on having an
+  actual long/short side, so a neutral (`direction="unknown"`) real signal
+  could still pass a stale/relaxed Markov+Kelly gate. **These rows were never
+  counted in directional or economic metrics** (no valid side/price to use),
+  so this did not contaminate any P/L or accuracy number in this report — it
+  only inflated the four variants' raw `would_trade` counts. Fixed forward
+  with an explicit `has_valid_side` gate; regression tests added
+  (`tests/test_shadow_unknown_side_no_trade.py`); no historical record was
+  rewritten.
+- **Reconciliation stall (found, root-caused, fixed):** both watchdog restarts
+  were the same deterministic failure: a transient
+  `httpcore.RemoteProtocolError("Server disconnected")` during Nautilus's
+  startup execution-state reconciliation makes
+  `SystemKernel.start_async()` (`nautilus_trader/system/kernel.py`) `return`
+  **before** `self._trader.start()` — the process stays alive but produces
+  zero market subscriptions, quotes, or heartbeats for ~45 minutes until the
+  external watchdog kills it. Reconciling real exchange order/fill state is
+  meaningless while `DRY_RUN=true` (no real order is ever placed), so
+  `bot.py` now passes `reconciliation=not simulation` to
+  `LiveExecEngineConfig`, skipping the vulnerable path entirely in dry-run
+  while leaving the safe `reconciliation=True` default for any live run.
+  Static regression test: `tests/test_reconciliation_dry_run_gate.py`.
+- **Cosmetic `[LIVE]` log label (found, fixed):** `execution/execution_engine.py`
+  logged `Initialized Execution Engine [LIVE]` even though `self.dry_run` was
+  correctly `True` (the log read the raw constructor arg, not the
+  config-resolved flag). Fixed; no trading-gate behaviour changed; regression
+  test `tests/test_execution_engine_mode_label.py`.
+- **Corrected results (pre-fee, $1 fixed risk, View B):** baseline n=36, net
+  +$4.09, ROR 11.4%, stays positive through a hypothetical 2% fee (+$3.37,
+  9.4%). `shadow_no_kelly` n=364, net +$8.29 pre-fee but ROR collapses to
+  0.28% at a hypothetical 2% fee, and its **paired, market-clustered
+  bootstrap incremental P/L vs baseline crosses zero** (mean +0.012, 95% CI
+  [-0.015, 0.036]) — its large raw P/L is **not** distinguishable from
+  baseline once markets are not double-counted across variants. LONG
+  consistently outperforms SHORT in both (baseline ROR 23.0% vs 4.0%;
+  shadow_no_kelly 3.5% vs 1.2%). No variant meets the pre-registered evidence
+  bar (§ below) — most are far short of n=300, and there is no true
+  out-of-sample (separate-week) confirmation yet.
+- **No strategy edge is claimed.** See `RESEARCH_FINDINGS.md` for full detail
+  and `NEXT_AGENT_TASKS.md` for the recommended next experiment (a second,
+  unmodified 7-day window — not a parameter change).
 
 ## New-run audit (2026-07-19 dry-run, schema-v2 live)
 

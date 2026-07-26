@@ -143,3 +143,108 @@ quote ages median ~0.23s (all < 60s); skew max 0.107s; 0 stale/skew/spread/cross
 Conclusion unchanged: only directional mapping and capture correctness are
 established. No economic edge. A 5–7 day dry-run is required (see
 [NEXT_AGENT_TASKS.md](NEXT_AGENT_TASKS.md)).
+
+## 10. Final 7-day closeout (2026-07-20 → 2026-07-26, frozen snapshot)
+
+Window `2026-07-20T04:17:10.903548Z → 2026-07-26T16:23:41.723Z` (runner_start
+pid 19538, `bot_args=[]`), ~6.46 of the intended 7 days (the operator elected
+to close out at this point rather than wait for the scheduled boundary; the
+collection service was not stopped by this audit). Full detail, hashes, and
+the frozen scoped source files are under `/home/star/polymarket-7d-final-audit/`.
+
+**Lifecycle:** 105 child cycles, 102 clean ~90-min restarts, 2 watchdog
+restarts (both `heartbeat_stale`, both root-caused to the same reconciliation
+stall — §13). 8,895 schema-v2 records, 930 would_trade rows, both books valid
+99.0%, official settlement coverage 930/930 at snapshot-fetch time.
+
+### View A — directional (Wilson 95% CI, informational only)
+
+| variant | n | accuracy | 95% CI |
+|---|---|---|---|
+| shadow_no_kelly | 367 | 92.9% | [89.8%, 95.1%] |
+| baseline / min_prob_082 / min_prob_084 / markov_10 / markov_15 / block_long_macro_bear / short_bias_macro_bear / side_specific_threshold | 36 | 75.0% | [58.9%, 86.3%] |
+| shadow_allow_kelly_minus_002 | 40 | 75.0% | [59.8%, 85.8%] |
+| shadow_allow_kelly_minus_005 | 41 | 75.6% | [60.7%, 86.2%] |
+| relaxed_markov_and_kelly_shadow | 40 | 75.0% | [59.8%, 85.8%] |
+| short_only | 22 | 72.7% | [51.9%, 86.9%] |
+| trend_guard_shadow | 22 | 86.4% | [66.7%, 95.3%] |
+| long_only | 14 | 78.6% | [52.4%, 92.4%] |
+
+### View B — executable paper economics (pre-fee, $1 fixed risk)
+
+- baseline: n=36, net **+$4.09**, ROR **11.4%** — LONG n=14 ROR 23.0%, SHORT
+  n=22 ROR 4.0%.
+- shadow_no_kelly: n=364, net **+$8.29**, ROR **2.3%** — LONG n=172 ROR
+  3.5%, SHORT n=192 ROR 1.2%. ~80% of its valid trades sit at entry price
+  ≥0.83 (near-certain favorites); P/L is well distributed (top-10 of 364
+  trades = 16.7% of total |P/L|), unlike baseline's concentrated top-10 of 36
+  = 45.5%.
+- All other variants: n=22–41, ROR 4.0%–26.5%, mostly identical to baseline
+  over this window (their parameter changes never bound).
+
+### Fee sensitivity (hypothetical sweep, 0/0.25/0.5/1/2% — NOT actual fees)
+
+| variant | 0% ROR | 1% ROR | 2% ROR |
+|---|---|---|---|
+| baseline | 11.4% | 10.4% | 9.4% |
+| shadow_no_kelly | 2.3% | 1.3% | **0.3%** |
+| trend_guard_shadow | 26.5% | 25.5% | 24.5% |
+
+`shadow_no_kelly`'s thin per-trade edge is fee-fragile; baseline and
+`trend_guard_shadow` stay comfortably positive through 2%.
+
+### Paired, market-clustered comparison vs baseline
+
+Bootstrap resamples **condition_id clusters**, not variant-rows, so the same
+market shared across 15 variants is never counted as 15 independent
+observations (see rule against pseudo-replication). `block_long_macro_bear`,
+`short_bias_macro_bear`, `min_prob_082/084`, `markov_window_10/15`,
+`side_specific_threshold` were **identical** to baseline this window (their
+gates never bound). `shadow_no_kelly` added 331 trades over baseline with
+mean incremental P/L +$0.012/trade but **95% CI [-0.015, +0.036] — crosses
+zero**. `shadow_allow_kelly_minus_002/005` and `relaxed_markov_and_kelly`
+added 4–5 trades each, incremental CIs also cross zero. **No variant's
+incremental contribution over baseline is statistically distinguishable from
+zero in this sample** — large raw n or raw P/L (rule: never rank by these
+alone) does not itself establish an edge.
+
+### Regime/day/half-window robustness
+
+Day-by-day cumulative pre-fee P/L (baseline) rose most days but had one down
+day (2026-07-21, -$1.41) and one partial-day dip (2026-07-26, -$0.61); still
+net positive across the full window. First-half vs second-half ROR: baseline
+26.3% → 3.9% (same sign, large magnitude drop — not a clean out-of-sample
+replication); shadow_no_kelly 3.1% → 1.6% (more stable). LONG > SHORT holds
+in both halves and both size classes.
+
+### 13. Execution reconciliation stall — 2/105 child cycles
+
+Both watchdog restarts (PIDs 29743 on 2026-07-22, 48947 on 2026-07-26) show
+the identical signature: `httpcore.RemoteProtocolError("Server disconnected")`
+during startup `generate_order_status_reports`/`generate_fill_reports` calls,
+then `ExecEngine: Applying post-reconciliation startup delay (10.0s)` as the
+**last** log line before ~45 minutes of total silence, then the watchdog's
+`SIGTERM`. Traced into `nautilus_trader/system/kernel.py:start_async()`:
+`if not await self._await_execution_reconciliation(): return` — the whole
+startup aborts (never reaches `self._trader.start()`), yet the asyncio event
+loop keeps spinning (the background continuous-reconciliation task's
+`asyncio.sleep`/loop), which is why the process doesn't exit on its own.
+Fixed by skipping reconciliation entirely while `DRY_RUN=true` (see
+`PROJECT_STATE.md`); the watchdog remains the safety net for any future,
+different stall.
+
+### Unknown-side would_trade — 96/930 rows, root-caused, forward-fixed
+
+See `PROJECT_STATE.md` and `tests/test_shadow_unknown_side_no_trade.py`. Not
+a pricing or safety defect — confined to raw `would_trade` labeling on 4
+Kelly-relaxed variants; never affected any economic or directional number in
+this report.
+
+### Conclusion
+
+No variant meets the documented minimum evidence bar (§ below /
+`NEXT_AGENT_TASKS.md`): sample sizes are 14–41 per baseline-family variant
+(only `shadow_no_kelly` clears n≥300, and its incremental edge over baseline
+is not distinguishable from zero), and this is a single continuous window,
+not two independent out-of-sample weeks. **No strategy edge is established.
+Live trading remains NOT APPROVED.**

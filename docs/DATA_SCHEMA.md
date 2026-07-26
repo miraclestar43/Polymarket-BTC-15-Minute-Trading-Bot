@@ -142,3 +142,18 @@ See [PAPER_EXECUTION_MODEL.md](PAPER_EXECUTION_MODEL.md) for the semantics.
 
 `market_id_v2` carries the market id under a new key so the original `market_id`
 is never clobbered.
+
+## `would_trade` / `shadow_side` semantics (updated 2026-07-26)
+
+`would_trade=true` requires `shadow_side` to be `"long"` or `"short"` (a
+`has_valid_side` gate in `core/strategy_brain/shadow_evaluator.py`). Records
+written **before** 2026-07-26 by the four Kelly-relaxed variants
+(`shadow_no_kelly`, `shadow_allow_kelly_minus_002`, `shadow_allow_kelly_minus_005`,
+`relaxed_markov_and_kelly_shadow`) may still show `would_trade=true` with
+`shadow_side="unknown"` and `selected_token_id=null` — a proven forward
+labeling bug (fixed forward only; historical records were not rewritten).
+Any consumer of `shadow_decisions_*.jsonl` **must** filter on
+`shadow_side in ("long", "short")` before treating a row as a real trade
+candidate, exactly as `scripts/dual_book_run_audit.py` already does. The new
+skip-reason value `no_valid_side: actual_direction=unknown` marks a correctly
+labeled no-trade going forward.

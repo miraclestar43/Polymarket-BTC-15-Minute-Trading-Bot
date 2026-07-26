@@ -137,3 +137,17 @@ A 4-hour full run confirmed the model live (`scripts/dual_book_run_audit.py`):
 - The forensic CSV records `depth_source`, `depth_level_count`, `l1_limited` and
   `stake_exceeded_top_level` per fill so the L1 limitation is explicit, never
   implied away.
+
+## 11. First observed partial fill (2026-07-25, full 7-day closeout)
+
+Across the full ~6.46-day closeout window (930 would_trade rows), exactly
+**one** real partial fill occurred: a LONG at `2026-07-25T07:28:02Z` requested
+1.136 shares but the observed top-of-book ask size was only 0.74 shares
+(`observed_ask_size=0.74`), so `paper_filled_shares=0.74`,
+`paper_unfilled_stake≈0.35`. This is the first live confirmation of the
+`stake_exceeded_top_level` path predicted (but never observed) in the earlier
+4-hour audit — still L1-only, no deeper liquidity fabricated, and the
+unfilled portion is honestly excluded from filled capital, not treated as a
+completed trade. All other 831 valid-executable fills over the window were
+full L1 fills (2 shorts were `unavailable` due to a transient crossed book,
+never fabricated).

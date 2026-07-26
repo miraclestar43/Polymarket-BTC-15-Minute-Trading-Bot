@@ -137,6 +137,18 @@ A `heartbeat_stale` within ~1\u20132 min of a `runner_start` is the (now-fixed)
 startup false-positive pattern; a `heartbeat_never_fresh` reason means a child
 never produced a fresh heartbeat within a full stale window \u2014 escalate to a
 human, do not raise the timeout.
+
+**2026-07-26 update:** a second, distinct `heartbeat_stale` pattern was found
+and fixed at the source \u2014 a child that hit a transient
+`RemoteProtocolError("Server disconnected")` during Nautilus startup
+execution-state reconciliation would sit completely inert (zero logs, zero
+heartbeats) for ~45 minutes until the watchdog killed it (2 occurrences in
+105 child cycles over the 2026-07-20..27 run). `bot.py` now skips that
+reconciliation path entirely while `DRY_RUN=true`, so this specific trigger
+should not recur \u2014 but the watchdog itself is unchanged and remains the
+backstop for any *other* stall. Hermes should keep watching for
+`heartbeat_stale`/`heartbeat_never_fresh` exactly as before; do not treat the
+fix as a reason to relax monitoring.
 ### 7.6 Dual-book NO-ask capability check (read-only)
 
 ```bash
