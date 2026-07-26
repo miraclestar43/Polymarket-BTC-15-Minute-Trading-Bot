@@ -248,3 +248,18 @@ No variant meets the documented minimum evidence bar (§ below /
 is not distinguishable from zero), and this is a single continuous window,
 not two independent out-of-sample weeks. **No strategy edge is established.
 Live trading remains NOT APPROVED.**
+
+### 14. Post-freeze tail — excluded, mixed-version, not part of Week 1
+
+The `2026-07-20..27` runner was never stopped and kept running past the
+`2026-07-26T16:23:41.723Z` freeze boundary while this session's three bug
+fixes were written to disk. Every record with `timestamp` after that
+boundary is a different code version than the frozen §10 dataset (proven via
+`journalctl`: the first post-freeze child, PID 51642, already logs
+`config.reconciliation=False`/`"Reconciliation deactivated"`, which only the
+fixed `bot.py` produces). This span is preserved on disk but is the
+**`post_freeze_unscoped_tail`** — explicitly excluded from every number in
+§10, and never appended to the Week-1 dataset. See `PROJECT_STATE.md` for
+the exact boundary and evidence. The recommended next step is an
+independent, fixed-commit Week-2 window (§ `NEXT_AGENT_TASKS.md`), not an
+extension of Week 1.

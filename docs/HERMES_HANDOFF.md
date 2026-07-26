@@ -162,3 +162,18 @@ fix as a reason to relax monitoring.
 This smoke test never starts the runner, `--live`, or any order path. It is the
 canonical check that the NO-token executable-price capture is working. See
 [PAPER_EXECUTION_MODEL.md](PAPER_EXECUTION_MODEL.md).
+
+### 7.7 Run provenance (added 2026-07-26)
+
+```bash
+# which commit/config is the CURRENT run session actually executing (read-only)
+cat logs/runs/*/run_manifest.json | python3 -c \
+  "import json,sys; [print(json.loads(l)['run_id'], json.loads(l)['git']['head'][:12], json.loads(l)['git']['dirty']) for l in sys.stdin]"
+```
+Hermes can quote `run_id`/`git_head`/`git_dirty` from the latest
+`logs/runs/<run_id>/run_manifest.json` when reporting run health — this
+disambiguates which code version a given day's `shadow_decisions_*.jsonl`
+records came from (the 2026-07-20..27 run had a mixed-version tail because
+source files changed while the runner stayed active — see
+`PROJECT_STATE.md`). Read-only only; Hermes must never write to
+`logs/runs/`.

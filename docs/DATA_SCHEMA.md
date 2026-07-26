@@ -157,3 +157,26 @@ Any consumer of `shadow_decisions_*.jsonl` **must** filter on
 candidate, exactly as `scripts/dual_book_run_audit.py` already does. The new
 skip-reason value `no_valid_side: actual_direction=unknown` marks a correctly
 labeled no-trade going forward.
+
+## Run provenance fields (added 2026-07-26)
+
+Every shadow record now carries a run-provenance block, computed **once per
+run session** by `15m_bot_runner.py` (`core/diagnostics/run_provenance.py`)
+and read back by each child from `POLY_RUN_*` environment variables — never
+a Git call or file hash per record, never per-child either (it is the same
+value for every child of the same runner session):
+
+| field | meaning |
+|-------|---------|
+| `run_id` | `run_<runner_start_epoch>_<runner_pid>` — stable for the whole run session |
+| `git_head` | full 40-char commit SHA the runner started from (local `git rev-parse HEAD`, no fetch) |
+| `git_branch` | branch name at runner start |
+| `git_dirty` | `true`/`false`/`"unavailable"` — whether the working tree had uncommitted changes at runner start |
+| `strategy_config_sha256` | SHA256 of `strategy.yaml` at runner start |
+
+`"unavailable"` (not a crash) is used whenever Git or a config file could
+not be read. See `logs/runs/<run_id>/run_manifest.json` /
+`run_manifest_end.json` for the fuller run-level record (Python version,
+hostname, `requirements.txt` hash, `dry_run`/`live_trading_ack`, lifecycle
+counts) — no secrets or raw environment contents are ever written to either
+the manifest or the shadow records.

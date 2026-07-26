@@ -1,8 +1,61 @@
 # PROJECT STATE
 
-_Last updated: 2026-07-26 (final 7-day DRY-RUN closeout audit). DRY-RUN ONLY._
+_Last updated: 2026-07-26 (Week-2 replication provenance hardening). DRY-RUN ONLY._
 
-_Exact final HEAD is recorded in /home/star/polymarket-7d-final-manifest.txt._
+_Exact final HEAD is recorded in /home/star/polymarket-w2-preflight-manifest.txt
+(prior closeout HEAD in /home/star/polymarket-7d-final-manifest.txt)._
+
+## Post-freeze tail (do not treat as part of Week-1)
+
+The Week-1 research window is **immutably frozen** at
+`2026-07-20T04:17:10.903548Z → 2026-07-26T16:23:41.723Z` (see the closeout
+section below). The `polymarket-collection-7d.service` runner (PID 19538)
+was **never stopped** and kept running past that freeze boundary while the
+three Week-1 bug fixes were being written to `bot.py`,
+`core/strategy_brain/shadow_evaluator.py`, and `execution/execution_engine.py`
+on disk. Because each child restarts from disk every ~90 minutes, records
+after the freeze boundary are **mixed-version**:
+
+- `2026-07-26T16:23:41.723Z → 16:48:13.818Z` (child `restart_index=105`,
+  PID 50147, already running at freeze time): same pre-fix code as all of
+  Week-1, but chronologically **after** the declared freeze boundary.
+- `2026-07-26T16:48:15.819Z` onward (child `restart_index=106`, PID 51642,
+  and every child since): confirmed via `journalctl` to be running the
+  **fixed** code (`config.reconciliation=False` / `"Reconciliation
+  deactivated"` appears in its startup log, which only the post-fix
+  `bot.py` produces).
+
+This entire span — **everything with `timestamp > 2026-07-26T16:23:41.723Z`**
+— is the **`post_freeze_unscoped_tail`**: it is preserved on disk (nothing
+was deleted, rotated, or rewritten) but is **explicitly excluded** from every
+Week-1 research metric in `RESEARCH_FINDINGS.md`. Do not append it to the
+Week-1 dataset and do not reinterpret Week-1 as a full, uninterrupted 7-day
+run — it is a 6.46-day frozen sample by design. As of this note the tail
+already contains 300+ shadow records and is still growing (the runner had
+not yet reached its actual `RuntimeMaxSec` boundary, ~2026-07-27T04:17:11Z,
+when this was written).
+
+## Run provenance (added 2026-07-26, for Week-2 readiness)
+
+To prevent this exact ambiguity from recurring, `15m_bot_runner.py` now
+computes a provenance fingerprint **once per run session** (never per child,
+never per record) via `core/diagnostics/run_provenance.py`: `run_id`, Git
+`HEAD`/branch/dirty-state (local-only, no fetch), `strategy.yaml` and
+`requirements.txt` SHA256, Python version, schema version, `hostname`,
+`dry_run`/`live_trading_ack`. It is written atomically to
+`logs/runs/<run_id>/run_manifest.json` at startup and
+`logs/runs/<run_id>/run_manifest_end.json` at shutdown (stop reason + final
+lifecycle counts), and passed to every child via `POLY_RUN_*` environment
+variables (no per-child Git calls or file hashing). `run_id`, `git_head`,
+`git_branch`, `git_dirty`, and `strategy_config_sha256` are now merged into
+every `shadow_decisions_*.jsonl` record. No secrets or raw environment
+contents are ever included — see `DATA_SCHEMA.md`.
+
+`scripts/preflight_dryrun.py` now also reports Git HEAD/dirty-state, config
+hashes, competing-runner state, and collection-service state, and accepts
+`--require-clean-git` to turn a dirty working tree into a blocking failure —
+required before starting the Week-2 replication run (see
+`NEXT_AGENT_TASKS.md`).
 
 ## What this project is
 

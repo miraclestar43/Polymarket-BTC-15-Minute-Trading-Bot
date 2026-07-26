@@ -115,10 +115,26 @@ freshness/skew/spread, book generation, market identity and paper-fill L1 depth.
 Writes `logs/dual_book_run_forensic.csv` + `logs/dual_book_run_audit.json`.
 Official outcomes are fetched read-only; deeper liquidity is never fabricated.
 
+## 0b. Run provenance and replication preflight (added 2026-07-26)
+
+`15m_bot_runner.py` writes `logs/runs/<run_id>/run_manifest.json` (Git
+HEAD/branch/dirty, config hashes, Python version, `dry_run`/
+`live_trading_ack`, hostname) once at startup, and
+`logs/runs/<run_id>/run_manifest_end.json` at shutdown (stop reason + final
+lifecycle counts). `run_id`/`git_head`/`git_branch`/`git_dirty`/
+`strategy_config_sha256` are propagated into every shadow record. Before a
+**replication** run that must execute one fixed commit for its whole
+duration, run preflight with the stricter flag:
+
+```bash
+.venv/bin/python scripts/preflight_dryrun.py --require-clean-git
+# any uncommitted change -> RESULT: BLOCKED (exit 1), not just a warning
+```
+
 ## 7. Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # expect 325 passed (2026-07-26 closeout)
+.venv/bin/python -m pytest tests/ -q     # expect 354 passed (2026-07-26 provenance hardening)
 ```
 
 ## 7c. DRY-RUN skips execution-state reconciliation (fixed 2026-07-26)

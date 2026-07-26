@@ -24,11 +24,15 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
 
 ## 2. Exact current HEAD
 
-- Branch `main`. The exact final HEAD after the 2026-07-26 closeout (audit
-  tooling, 3 bug fixes, tests, docs) is recorded in
-  `/home/star/polymarket-7d-final-manifest.txt`. Pre-closeout HEAD was
-  `4c9da8d`. Commits are **not pushed** — the exact push command is in that
-  manifest, not executed.
+- Branch `main`. The exact HEAD after the 2026-07-26 provenance-hardening
+  session (run provenance, replication preflight, tests, docs) is recorded
+  in `/home/star/polymarket-w2-preflight-manifest.txt`. That session built
+  on the closeout HEAD recorded in `/home/star/polymarket-7d-final-manifest.txt`
+  (itself built on pre-closeout HEAD `4c9da8d`). Commits are **not pushed** —
+  the exact push command is in the newer manifest, not executed. **Week 2
+  must start from this exact HEAD** (or a later descendant), with a clean
+  working tree (`--require-clean-git`), and must not change commits for its
+  entire 7-day duration.
 
 ## 3. Valid vs invalid historical conclusions
 
@@ -82,8 +86,13 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
 
 **Do not change strategy logic for this next run.** The single most
 scientifically load-bearing next step is a **second, independent, unmodified
-7-day DRY-RUN window** — a true out-of-sample replication, not a new
-variant:
+7-day DRY-RUN window run at one fixed Git commit for its entire duration**
+— a true out-of-sample replication, not a new variant. Week 1
+(`2026-07-20..27`) had source files change mid-run because the runner was
+never stopped while this session's bug fixes were written; Week 2 must not
+repeat that ambiguity (see `PROJECT_STATE.md` §"Post-freeze tail" and
+§"Run provenance"). Confirm with `--require-clean-git` preflight (§7a)
+before starting, and do not touch the repo for the full 7 days once started.
 
 - **Hypothesis:** baseline's week-1 pre-fee executable ROR (+11.4%,
   directional accuracy 75.0%) and its LONG≫SHORT asymmetry (23.0% vs 4.0%
@@ -115,24 +124,75 @@ variant:
   remains NOT APPROVED regardless of outcome** — that requires a separate,
   explicit, human-reviewed decision outside this research loop.
 
-Exact command (NOT executed by this closeout — run only after human
-approval; uses a fresh unit name so it cannot collide with the still-running
-week-1 unit):
+## 7a. Week-2 acceptance criteria (define BEFORE starting, per replication discipline)
+
+**Data integrity**
+- 100% of records at the current forward schema (`schema_version=2` plus
+  the `run_id`/`git_head`/`strategy_config_sha256` provenance fields).
+- ≥98% both-book availability.
+- ≥95% official settlement coverage after a final backfill sweep.
+- Zero YES-midpoint-as-NO reuse (already structurally impossible — proven
+  0/0 across Week 1).
+- Zero selected-token/side mismatch.
+- Zero `would_trade=true` with `shadow_side="unknown"` (the forward fix is
+  in effect for the whole run since it starts at one fixed, already-fixed
+  commit — unlike Week 1, there should be **no** such records at all).
+- Every executable P/L record has a contemporaneous selected-token ask.
+- L1 depth limitation explicitly retained and labelled, never silently
+  assumed away.
+- **Exactly one `git_head` value across every record in the run** (verify
+  this first — it is the entire point of the provenance fields).
+
+**Reliability**
+- No reconciliation-induced dry-run stall (the fix should make this class of
+  watchdog restart disappear entirely — confirm via `runner_events.jsonl`).
+- Every watchdog event (if any) investigated with the same rigor as Week 1's
+  two.
+- Every planned child restart resubscribes both books with no stale carry-over.
+- No competing runner at any point (`polymarket-collection-7d.service` must
+  be fully stopped before Week 2 starts).
+- No mixed Git commits within the run (see data-integrity bullet above).
+
+**Research**
+- No edge conclusion from raw P/L or raw n alone.
+- Market-clustered paired uncertainty (bootstrap by `condition_id`, not by
+  variant-row).
+- First-half vs second-half reporting within Week 2.
+- Week-1 vs Week-2 out-of-sample comparison (§7 primary comparisons).
+- Hypothetical fee sensitivity (0/0.25/0.5/1/2%), clearly labelled
+  hypothetical.
+- P/L concentration analysis (top-1/5/10).
+- No live-trading recommendation, regardless of result.
+
+**A technically successful run does NOT require positive P/L** — data
+completeness, reliability, and methodology are the pass/fail bar, not
+profitability.
+
+## 7b. Exact commands (NOT executed by this task — run only after human approval)
 
 ```bash
 cd /home/star/polymarket-BTC-15-Minute-Trading-Bot
-.venv/bin/python scripts/preflight_dryrun.py          # expect RESULT: OK
+.venv/bin/python scripts/preflight_dryrun.py --require-clean-git
+# expect RESULT: OK — a dirty tree BLOCKS (exit 1); commit or stash first.
+```
+Start (uses a fresh unit name so it cannot collide with the Week-1 unit;
+`RuntimeMaxSec=7d`; not a persistent/enabled service, does not auto-restart
+after completion — `Restart=no` is the systemd-run default):
+```bash
 systemd-run --user --unit=polymarket-collection-7d-w2.service \
   --working-directory=/home/star/polymarket-BTC-15-Minute-Trading-Bot \
   --property=RuntimeMaxSec=7d \
   /home/star/polymarket-BTC-15-Minute-Trading-Bot/.venv/bin/python \
   /home/star/polymarket-BTC-15-Minute-Trading-Bot/15m_bot_runner.py
-# let it run the full 7 days (self-restarts clean children ~every 90 min)
+# let it run the full 7 days untouched (self-restarts clean children ~every 90 min)
 ```
-Stop (only if ever needed, and only with approval):
-`systemctl --user stop polymarket-collection-7d-w2.service`.
-Audit afterwards with the exact window from `logs/runner_events.jsonl`
-(never `--latest-run` without first proving it matches):
+Stop (only if ever genuinely needed, and only with approval):
+```bash
+systemctl --user stop polymarket-collection-7d-w2.service
+```
+Audit afterwards with the exact window from `logs/runner_events.jsonl` and
+`logs/runs/<run_id>/run_manifest.json` (never `--latest-run` without first
+proving it matches):
 ```bash
 .venv/bin/python scripts/dual_book_run_audit.py --since <ISO> --until <ISO>
 ```
@@ -171,7 +231,19 @@ Audit afterwards with the exact window from `logs/runner_events.jsonl`
    Tests: `tests/test_execution_engine_mode_label.py`.
 
 None of these changed Kelly, Markov, thresholds, side selection, model
-probabilities, or sizing. Full pytest suite: 325 passed (was 314).
+probabilities, or sizing.
+
+## 13. Run provenance + replication preflight (2026-07-26, this session)
+
+Added `core/diagnostics/run_provenance.py` (Git HEAD/branch/dirty, config
+hashes, run_id — computed once per run session, propagated to children via
+env vars and into shadow records; never per-record, never a secret) and
+`logs/runs/<run_id>/run_manifest.json` (+ `run_manifest_end.json`).
+`scripts/preflight_dryrun.py` gained Git-state/config-hash/competing-runner/
+collection-service checks and `--require-clean-git`. This exists specifically
+so Week 2 cannot repeat Week 1's post-freeze mixed-version tail (§4, §"Post-freeze
+tail" in `PROJECT_STATE.md`). No strategy logic changed. Full pytest suite:
+354 passed (was 325 after the prior closeout, 314 before that).
 
 ## 10. Exact Hermes read-only monitoring commands
 
