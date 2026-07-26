@@ -2332,7 +2332,14 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
             log_directory="./logs/nautilus",
         ),
         data_engine=LiveDataEngineConfig(qsize=6000),
-        exec_engine=LiveExecEngineConfig(qsize=6000),
+        # Nautilus aborts the entire startup (never calls Trader.start(), so no
+        # market subscriptions/heartbeat ever happen) if execution-state
+        # reconciliation fails, e.g. a transient RemoteProtocolError from the
+        # exchange (see kernel.py: `if not await self._await_execution_reconciliation(): return`).
+        # Reconciling exchange order/fill state is meaningless in DRY_RUN
+        # (no real orders are ever placed), so skip it while simulation=True;
+        # a live run keeps the safe default (reconciliation=True).
+        exec_engine=LiveExecEngineConfig(qsize=6000, reconciliation=not simulation),
         risk_engine=LiveRiskEngineConfig(bypass=simulation),
         data_clients={POLYMARKET: poly_data_cfg},
         exec_clients={POLYMARKET: poly_exec_cfg},
