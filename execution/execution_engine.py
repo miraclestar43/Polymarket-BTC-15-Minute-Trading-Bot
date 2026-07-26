@@ -137,7 +137,13 @@ class ExecutionEngine:
         self._filled_orders = 0
         self._rejected_orders = 0
         
-        mode = "DRY RUN" if dry_run else "LIVE"
+        # Use self.dry_run (the effective, config-resolved flag), not the raw
+        # `dry_run` constructor argument: the singleton is constructed with
+        # dry_run=None (see get_execution_engine() below) so the argument
+        # alone is always falsy, which previously logged a misleading
+        # "[LIVE]" label even though self.dry_run correctly gated all order
+        # behaviour (lines below) as True.
+        mode = "DRY RUN" if self.dry_run else "LIVE"
         logger.info(f"Initialized Execution Engine [{mode}]")
     
     async def execute_signal(
