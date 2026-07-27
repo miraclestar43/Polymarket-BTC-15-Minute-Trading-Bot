@@ -149,6 +149,25 @@ should not recur \u2014 but the watchdog itself is unchanged and remains the
 backstop for any *other* stall. Hermes should keep watching for
 `heartbeat_stale`/`heartbeat_never_fresh` exactly as before; do not treat the
 fix as a reason to relax monitoring.
+
+**2026-07-27 update — heartbeat is now run-owned, and overlapping runs are
+explicitly prohibited:** a first Week-2 replication attempt
+(`run_1785102520_55073`) was started without stopping the still-active
+Week-1 runner; both wrote to a single shared `logs/bot_heartbeat.json`, so
+either child could refresh the heartbeat the *other* run's watchdog was
+reading — a real stall-masking risk, not just a theoretical one. The
+heartbeat is now per-run (`logs/runs/<run_id>/heartbeat.json`, identity-
+checked by the watchdog), and `scripts/preflight_dryrun.py --require-isolated-run`
+hard-fails if a competing runner/service/unclosed-manifest is found. Hermes
+should never observe (and should flag as anomalous) more than one
+`polymarket-collection-*.service` active at a time, or a `run_manifest.json`
+without a matching `run_manifest_end.json`/`abort_manifest.json` for a run
+that isn't the currently-active one. Read-only check:
+```bash
+systemctl --user list-units --all --no-legend "polymarket-collection-*.service" | grep active
+# should show at most ONE line
+```
+
 ### 7.6 Dual-book NO-ask capability check (read-only)
 
 ```bash

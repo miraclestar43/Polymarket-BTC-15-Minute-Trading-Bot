@@ -24,14 +24,17 @@ _DRY-RUN research handoff. Live trading is **NOT APPROVED**. Read this first._
 
 ## 2. Exact current HEAD
 
-- Branch `main`. The exact HEAD after the 2026-07-26 provenance-hardening
-  session (run provenance, replication preflight, tests, docs) is recorded
-  in `/home/star/polymarket-w2-preflight-manifest.txt`. That session built
-  on the closeout HEAD recorded in `/home/star/polymarket-7d-final-manifest.txt`
+- Branch `main`. The exact HEAD after the 2026-07-27 isolation-hardening
+  session (run-owned heartbeat, `--require-isolated-run` preflight, aborted-
+  pilot classification, tests, docs) is recorded in
+  `/home/star/polymarket-w2-isolation-manifest.txt`. That session built on
+  the provenance-hardening HEAD in `/home/star/polymarket-w2-preflight-manifest.txt`,
+  which built on the closeout HEAD in `/home/star/polymarket-7d-final-manifest.txt`
   (itself built on pre-closeout HEAD `4c9da8d`). Commits are **not pushed** —
-  the exact push command is in the newer manifest, not executed. **Week 2
+  the exact push command is in the newest manifest, not executed. **Week 2
   must start from this exact HEAD** (or a later descendant), with a clean
-  working tree (`--require-clean-git`), and must not change commits for its
+  working tree (`--require-clean-git`) **and an isolated environment**
+  (`--require-isolated-run` — see §7b), and must not change commits for its
   entire 7-day duration.
 
 ## 3. Valid vs invalid historical conclusions
@@ -126,6 +129,19 @@ before starting, and do not touch the repo for the full 7 days once started.
 
 ## 7a. Week-2 acceptance criteria (define BEFORE starting, per replication discipline)
 
+**A first attempt (`run_1785102520_55073`) already failed the isolation
+criterion below and was aborted — its 360 records are excluded from every
+Week-2 metric. Do not include them. See `PROJECT_STATE.md` and
+`RESEARCH_FINDINGS.md` §15.**
+
+**Isolation (checked automatically by `--require-isolated-run`)**
+- Exactly one collection run active at any time — no competing
+  `15m_bot_runner.py`/`bot.py` process, no second active
+  `polymarket-collection-*.service`, no unclosed prior run manifest.
+- Every `shadow_decisions_*.jsonl` record consumed by a Week-2 audit has
+  `run_id` equal to the intended Week-2 `run_id` — verify this explicitly
+  even though the check above should make a second run impossible to start.
+
 **Data integrity**
 - 100% of records at the current forward schema (`schema_version=2` plus
   the `run_id`/`git_head`/`strategy_config_sha256` provenance fields).
@@ -170,12 +186,24 @@ profitability.
 
 ## 7b. Exact commands (NOT executed by this task — run only after human approval)
 
+**A first Week-2 attempt (`run_1785102520_55073`, 2026-07-26T21:48:40Z →
+2026-07-27T03:53:46Z) was started without stopping Week 1 first and had to
+be aborted — see `PROJECT_STATE.md` "Aborted Week-2 pilot" and "Isolation
+hardening".  `--require-isolated-run` now makes this a hard preflight gate.
+Never start a second collection run while one is active — confirm BOTH
+services are stopped (`systemctl --user list-units --all | grep polymarket`
+should show neither `polymarket-collection-7d.service` nor
+`polymarket-collection-7d-w2.service` as `active`) before proceeding.**
+
 ```bash
 cd /home/star/polymarket-BTC-15-Minute-Trading-Bot
-.venv/bin/python scripts/preflight_dryrun.py --require-clean-git
-# expect RESULT: OK — a dirty tree BLOCKS (exit 1); commit or stash first.
+.venv/bin/python scripts/preflight_dryrun.py --require-clean-git --require-isolated-run
+# expect RESULT: OK. A dirty tree, a competing 15m_bot_runner.py/bot.py
+# process, an active polymarket-collection-*.service, or an unclosed prior
+# run manifest all BLOCK (exit 1) -- resolve before proceeding, do not
+# override.
 ```
-Start (uses a fresh unit name so it cannot collide with the Week-1 unit;
+Start (uses a fresh unit name so it cannot collide with any prior unit;
 `RuntimeMaxSec=7d`; not a persistent/enabled service, does not auto-restart
 after completion — `Restart=no` is the systemd-run default):
 ```bash
@@ -186,13 +214,20 @@ systemd-run --user --unit=polymarket-collection-7d-w2.service \
   /home/star/polymarket-BTC-15-Minute-Trading-Bot/15m_bot_runner.py
 # let it run the full 7 days untouched (self-restarts clean children ~every 90 min)
 ```
+Immediately after starting, confirm the new run's own manifest and
+run-owned heartbeat both exist and carry a single, matching `run_id`:
+```bash
+cat logs/runs/*/run_manifest.json | tail -1
+cat logs/runs/*/heartbeat.json | tail -1
+```
 Stop (only if ever genuinely needed, and only with approval):
 ```bash
 systemctl --user stop polymarket-collection-7d-w2.service
 ```
 Audit afterwards with the exact window from `logs/runner_events.jsonl` and
 `logs/runs/<run_id>/run_manifest.json` (never `--latest-run` without first
-proving it matches):
+proving it matches), and confirm every audited record's `run_id` matches
+the intended Week-2 `run_id`:
 ```bash
 .venv/bin/python scripts/dual_book_run_audit.py --since <ISO> --until <ISO>
 ```
@@ -242,8 +277,40 @@ env vars and into shadow records; never per-record, never a secret) and
 `scripts/preflight_dryrun.py` gained Git-state/config-hash/competing-runner/
 collection-service checks and `--require-clean-git`. This exists specifically
 so Week 2 cannot repeat Week 1's post-freeze mixed-version tail (§4, §"Post-freeze
-tail" in `PROJECT_STATE.md`). No strategy logic changed. Full pytest suite:
-354 passed (was 325 after the prior closeout, 314 before that).
+tail" in `PROJECT_STATE.md`). No strategy logic changed.
+
+## 14. Isolation hardening after the aborted Week-2 pilot (2026-07-27, this session)
+
+Despite §13's provenance work, a first Week-2 attempt
+(`run_1785102520_55073`) was still started while Week 1 was active, because
+nothing yet *blocked* it — provenance alone only makes overlap detectable
+after the fact, not preventable. This session closes that gap:
+
+1. **Run-owned heartbeat** (`core/diagnostics/run_provenance.py`:
+   `write_heartbeat`/`read_heartbeat`/`heartbeat_path`; `bot.py`:
+   `HealthWatchdog`; `15m_bot_runner.py`: `RunnerWatchdog._valid_heartbeat`/
+   `_check_heartbeat`) — `logs/runs/<run_id>/heartbeat.json`, identity-
+   checked (`run_id`, `runner_pid`, `child_pid`, `child_generation`,
+   timestamp-vs-child-start) before ever counting as evidence of liveness.
+   Legacy `logs/bot_heartbeat.json` kept as compatibility-only output.
+2. **`--require-isolated-run`** (`scripts/preflight_dryrun.py`) — hard-fails
+   on a competing runner/child, an active competing service, or an unclosed
+   run manifest. Process detection reads `/proc` directly (no `pgrep`/`grep`
+   subprocess, so it cannot self-match); requires an exact
+   `[python-interpreter, script-basename]` argv match plus a matching `cwd`.
+3. **`run_id` on every runner lifecycle event** — `runner_start`,
+   `child_start`, `child_exit`, `watchdog_restart`, `runner_stop` in the
+   shared `logs/runner_events.jsonl` all now carry `run_id` (module-level
+   `_CURRENT_RUN_ID`, set once at runner startup). A run-scoped watchdog
+   index (`logs/runs/<run_id>/watchdog_events.jsonl`) additionally mirrors
+   `watchdog_restart` events for that run alone.
+4. **Aborted-pilot classification** (`run_provenance.write_abort_manifest`)
+   — `logs/runs/run_1785102520_55073/abort_manifest.json`, a separate,
+   immutable file; the original manifests and all 360 raw records are
+   untouched.
+
+No strategy logic changed. Full pytest suite: 384 passed (was 354 after
+§13, 325 after the prior closeout, 314 before that).
 
 ## 10. Exact Hermes read-only monitoring commands
 

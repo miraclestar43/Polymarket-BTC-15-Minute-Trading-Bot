@@ -1,9 +1,78 @@
 # PROJECT STATE
 
-_Last updated: 2026-07-26 (Week-2 replication provenance hardening). DRY-RUN ONLY._
+_Last updated: 2026-07-27 (isolation hardening after aborted Week-2 pilot). DRY-RUN ONLY._
 
-_Exact final HEAD is recorded in /home/star/polymarket-w2-preflight-manifest.txt
-(prior closeout HEAD in /home/star/polymarket-7d-final-manifest.txt)._
+_Exact final HEAD is recorded in /home/star/polymarket-w2-isolation-manifest.txt
+(prior manifests: /home/star/polymarket-w2-preflight-manifest.txt,
+/home/star/polymarket-7d-final-manifest.txt)._
+
+## Aborted Week-2 pilot: run_1785102520_55073 (do not use, excluded)
+
+A first Week-2 attempt (`systemd unit polymarket-collection-7d-w2.service`,
+runner PID 55073, `git_head=6106051`) was started **without first stopping**
+the still-active Week-1 runner (`polymarket-collection-7d.service`, PID
+19538). It ran `2026-07-26T21:48:40.853887Z → 2026-07-27T03:53:46.619962Z`
+(~6h05m, 360 shadow records) before both services were stopped by the
+operator on discovery. A read-only audit proved both runners wrote to the
+same shared `logs/runner_events.jsonl`, the same daily
+`shadow_decisions_*.jsonl` files, and — at the time — the same single
+`logs/bot_heartbeat.json` with no per-run identity, so either child could
+refresh the heartbeat the *other* runner's watchdog was reading (empirically
+confirmed: the observed heartbeat's `uptime_s` matched the Week-1 child, not
+the Week-2 child, during the audit).
+
+This run is classified **`status: aborted_isolation_pilot`** in
+`logs/runs/run_1785102520_55073/abort_manifest.json` (a separate, immutable
+file — the original start/end manifests and all 360 raw shadow records are
+untouched, nothing was deleted or rewritten). **It is excluded from all
+Week-2 replication metrics** — not for a data-quality defect (its own
+records are clean: fixed Git HEAD throughout, 0 unknown-side records, 0
+reconciliation stalls, 0 watchdog restarts of its own) but purely because it
+was not isolated, so its heartbeat/liveness evidence cannot be trusted and it
+does not satisfy the Week-2 acceptance criteria (`NEXT_AGENT_TASKS.md` §7a).
+
+## Isolation hardening (2026-07-27)
+
+Two changes close the gap that allowed the above:
+
+1. **Run-owned heartbeat.** The heartbeat is no longer a single shared file.
+   Each run session's child writes to `logs/runs/<run_id>/heartbeat.json`
+   (atomic write) carrying `run_id`, `runner_pid`, `child_pid`,
+   `child_generation`, `child_start_ts`, `timestamp`, `git_head`,
+   `schema_version`. The runner's watchdog (`RunnerWatchdog._valid_heartbeat`
+   in `15m_bot_runner.py`) only accepts a heartbeat when **all** of
+   `run_id`, `runner_pid`, `child_pid`, `child_generation` match its own
+   current run/child **and** the heartbeat timestamp is at/after the current
+   child's own start — a heartbeat from another run or an old child of the
+   same run is treated exactly like no heartbeat at all (logged as
+   `heartbeat_wrong_run` / `heartbeat_wrong_child`), never as evidence of
+   liveness. The stale threshold (45 min) and the existing startup-grace
+   behavior for `heartbeat_never_fresh` are unchanged. The legacy shared
+   `logs/bot_heartbeat.json` is still written for manual/compatibility use
+   only — the watchdog never reads it. **A heartbeat from a second
+   concurrent run can no longer mask a stall in this run's watchdog.**
+   Journal/shadow staleness checks in the same watchdog still use shared,
+   non-run-scoped file globs — a known, smaller residual risk (see
+   "Remaining risks" in the latest audit response), out of scope for this
+   change.
+2. **Isolated-run preflight.** `scripts/preflight_dryrun.py --require-isolated-run`
+   hard-fails (exit 1) if any of: another `15m_bot_runner.py` process,
+   another `bot.py` child, any active `polymarket-collection-*.service`, or
+   an unclosed prior run manifest (a `logs/runs/<run_id>/` with a start
+   manifest but no end/abort manifest) is found. Process matching reads
+   `/proc` directly (never shells out to `pgrep`/`grep`) and requires an
+   exact `[python-interpreter, script-basename]` argv match plus a matching
+   `cwd` — a grep invocation, an editor with the file open, or an unrelated
+   same-named script cannot false-positive. Without the flag these same
+   conditions are reported as non-blocking warnings (unchanged default
+   behavior). Every runner lifecycle event (`runner_start`, `child_start`,
+   `child_exit`, `watchdog_restart`, `runner_stop`) written to the shared
+   `logs/runner_events.jsonl` now also carries `run_id`, so even a shared
+   file can be scoped correctly.
+
+**Explicit rule: never start a second collection run while one is active.**
+`--require-isolated-run` exists specifically to make this a hard preflight
+gate, not a judgment call, before Week 2 actually starts.
 
 ## Post-freeze tail (do not treat as part of Week-1)
 

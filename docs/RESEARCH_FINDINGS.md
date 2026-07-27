@@ -263,3 +263,19 @@ fixed `bot.py` produces). This span is preserved on disk but is the
 the exact boundary and evidence. The recommended next step is an
 independent, fixed-commit Week-2 window (§ `NEXT_AGENT_TASKS.md`), not an
 extension of Week 1.
+
+### 15. Aborted Week-2 pilot (run_1785102520_55073) — excluded, not a Week-2 result
+
+A first Week-2 attempt ran `2026-07-26T21:48:40.853887Z → 2026-07-27T03:53:46.619962Z`
+(~6h05m, 360 shadow records, single fixed `git_head=6106051` throughout,
+0 unknown-side records, 0 reconciliation stalls, 0 watchdog restarts of its
+own) alongside the still-active Week-1 runner, sharing
+`logs/runner_events.jsonl`, `shadow_decisions_*.jsonl`, and — at the time —
+a single unowned `logs/bot_heartbeat.json`. It is classified
+`aborted_isolation_pilot` in `logs/runs/run_1785102520_55073/abort_manifest.json`
+and is **excluded from all Week-2 replication metrics** for isolation-
+methodology reasons, not a data-quality defect. Do not include any of its
+360 records, and do not treat it as evidence toward or against the Week-2
+hypothesis. See `PROJECT_STATE.md` "Isolation hardening" for the fix
+(run-owned heartbeat + `--require-isolated-run` preflight) applied before
+any future Week-2 attempt.

@@ -124,17 +124,34 @@ HEAD/branch/dirty, config hashes, Python version, `dry_run`/
 lifecycle counts). `run_id`/`git_head`/`git_branch`/`git_dirty`/
 `strategy_config_sha256` are propagated into every shadow record. Before a
 **replication** run that must execute one fixed commit for its whole
-duration, run preflight with the stricter flag:
+duration, run preflight with the stricter flags:
 
 ```bash
-.venv/bin/python scripts/preflight_dryrun.py --require-clean-git
-# any uncommitted change -> RESULT: BLOCKED (exit 1), not just a warning
+.venv/bin/python scripts/preflight_dryrun.py --require-clean-git --require-isolated-run
+# any uncommitted change, OR another 15m_bot_runner.py/bot.py process, OR any
+# active polymarket-collection-*.service, OR an unclosed prior run manifest
+# -> RESULT: BLOCKED (exit 1), not just a warning
+```
+
+## 0c. Heartbeat ownership (added 2026-07-27)
+
+The heartbeat is run-owned, not a single shared file: the current child of
+each run session writes `logs/runs/<run_id>/heartbeat.json` (atomic write,
+carries `run_id`/`runner_pid`/`child_pid`/`child_generation`/`git_head`).
+The watchdog only accepts a heartbeat that matches all four identity fields
+for its own current child — see `PROJECT_STATE.md` "Isolation hardening"
+for why (a real incident: `run_1785102520_55073` ran ~6h alongside the
+still-active Week-1 runner, sharing a single unowned heartbeat file). The
+legacy `logs/bot_heartbeat.json` is still written for manual `tail -f` use,
+but the watchdog never reads it. Manual check:
+```bash
+cat logs/runs/<run_id>/heartbeat.json   # run_id, child_pid, timestamp, uptime_s
 ```
 
 ## 7. Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # expect 354 passed (2026-07-26 provenance hardening)
+.venv/bin/python -m pytest tests/ -q     # expect 384 passed (2026-07-27 isolation hardening)
 ```
 
 ## 7c. DRY-RUN skips execution-state reconciliation (fixed 2026-07-26)
