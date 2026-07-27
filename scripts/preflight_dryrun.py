@@ -252,40 +252,118 @@ def _check_config_hashes(chk: Check) -> None:
             req_hash[:16] + "…" if req_hash else "requirements.txt not found")
 
 
-def _check_no_competing_runner(chk: Check) -> None:
+def _iter_proc_cmdlines():
+    """Yield (pid, argv) for every readable /proc/<pid>/cmdline. Reads /proc
+    directly rather than shelling out to pgrep/grep: a subprocess-based
+    substring search (e.g. `pgrep -f 15m_bot_runner.py`) risks matching an
+    unrelated process whose cmdline happens to contain that text (an editor
+    window, a grep invocation itself, etc). Matching is done by callers on
+    an exact argv-token basename instead of a raw substring."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        argv = [a for a in raw.decode("utf-8", "replace").split("\x00") if a]
+        if argv:
+            yield int(entry.name), argv
+
+
+def _proc_cwd(pid: int) -> Optional[str]:
     try:
-        out = subprocess.run(
-            ["pgrep", "-af", "15m_bot_runner.py"],
-            capture_output=True, text=True, timeout=5)
-        # Exclude nothing special: pgrep only matches processes whose cmdline
-        # contains the pattern, and this preflight script's own cmdline does
-        # not, so no self-match is possible.
-        lines = [l for l in out.stdout.splitlines() if l.strip()]
-        if lines:
-            pids = ", ".join(l.split()[0] for l in lines)
-            chk.add("no competing runner", WARN,
-                    f"15m_bot_runner.py already running (pid(s): {pids})")
-        else:
-            chk.add("no competing runner", PASS, "no other 15m_bot_runner.py process")
-    except (OSError, subprocess.SubprocessError):
-        chk.add("no competing runner", WARN, "pgrep unavailable")
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
 
 
-def _check_collection_service_inactive(chk: Check) -> None:
+def _find_project_processes(script_basename: str, exclude_pid: int) -> list:
+    """PIDs of other processes that are actually RUNNING this script, not
+    merely mentioning its name. Both 15m_bot_runner.py and bot.py are only
+    ever launched as `[python_executable, script[, args...]]` (see
+    run_bot()'s subprocess.Popen call), so require: argv[0] looks like a
+    Python interpreter AND argv[1]'s basename is EXACTLY script_basename
+    AND the process's cwd resolves to this project's root. A raw substring/
+    any-token search would false-positive on e.g. `grep -r 15m_bot_runner.py`
+    (the pattern is a standalone argv token there too) or an editor with the
+    file open -- this does not."""
+    project_root_resolved = str(PROJECT_ROOT.resolve())
+    matches = []
+    for pid, argv in _iter_proc_cmdlines():
+        if pid == exclude_pid or len(argv) < 2:
+            continue
+        if "python" not in Path(argv[0]).name:
+            continue
+        if Path(argv[1]).name != script_basename:
+            continue
+        if _proc_cwd(pid) == project_root_resolved:
+            matches.append(pid)
+    return matches
+
+
+def _find_unclosed_run_manifests(repo_root: Path) -> list:
+    """run_id directories that have a start manifest but no matching
+    end/abort manifest -- i.e. a run session that is (or was left) active."""
+    runs_dir = repo_root / "logs" / "runs"
+    if not runs_dir.is_dir():
+        return []
+    unclosed = []
+    for d in sorted(runs_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        if (d / "run_manifest.json").exists() \
+                and not (d / "run_manifest_end.json").exists() \
+                and not (d / "abort_manifest.json").exists():
+            unclosed.append(d.name)
+    return unclosed
+
+
+def _check_isolated_run(chk: Check, require_isolated: bool) -> None:
+    """Competing-runner / competing-service / unclosed-run checks. WARN by
+    default; escalated to a blocking FAIL under --require-isolated-run,
+    which a replication run must pass before starting -- this exists
+    because the first Week-2 attempt (run_1785102520_55073) ran for ~6h
+    alongside the still-active Week-1 runner, sharing logs/runner_events.jsonl,
+    shadow_decisions files, and (at the time) a single unowned heartbeat
+    file, creating a real watchdog stall-masking risk. See
+    docs/PROJECT_STATE.md."""
+    level = FAIL if require_isolated else WARN
+    my_pid = os.getpid()
+
+    runner_pids = _find_project_processes("15m_bot_runner.py", my_pid)
+    chk.add("no competing 15m_bot_runner.py", PASS if not runner_pids else level,
+            "none found" if not runner_pids
+            else f"already running (pid(s): {', '.join(map(str, runner_pids))})")
+
+    bot_pids = _find_project_processes("bot.py", my_pid)
+    chk.add("no competing bot.py child", PASS if not bot_pids else level,
+            "none found" if not bot_pids
+            else f"already running (pid(s): {', '.join(map(str, bot_pids))})")
+
     try:
         out = subprocess.run(
             ["systemctl", "--user", "list-units", "--all",
              "--no-legend", "--plain", "polymarket-collection-*.service"],
             capture_output=True, text=True, timeout=5)
-        active = [l for l in out.stdout.splitlines() if " active " in f" {l} "]
+        active = [l.split()[0] for l in out.stdout.splitlines() if " active " in f" {l} "]
         if active:
-            chk.add("collection service not already active", WARN,
-                    "; ".join(l.split()[0] for l in active))
+            chk.add("no active collection service", level, "; ".join(active))
         else:
-            chk.add("collection service not already active", PASS,
+            chk.add("no active collection service", PASS,
                     "no polymarket-collection-*.service currently active")
     except (OSError, subprocess.SubprocessError):
-        chk.add("collection service not already active", WARN, "systemctl unavailable")
+        chk.add("no active collection service", WARN, "systemctl unavailable")
+
+    orphans = _find_unclosed_run_manifests(PROJECT_ROOT)
+    chk.add("no unclosed run manifest", PASS if not orphans else level,
+            "all prior runs have an end or abort manifest" if not orphans
+            else f"missing end/abort manifest for: {', '.join(orphans)}")
 
 
 def main(argv=None) -> int:
@@ -297,6 +375,14 @@ def main(argv=None) -> int:
                          "uncommitted changes — use before starting a "
                          "replication run that must execute one fixed "
                          "commit for its entire 7-day duration.")
+    ap.add_argument("--require-isolated-run", action="store_true",
+                    help="fail (not just warn) if another 15m_bot_runner.py "
+                         "or bot.py process, another active "
+                         "polymarket-collection-*.service, or an unclosed "
+                         "prior run manifest is found — use before starting "
+                         "a replication run; overlapping runs share "
+                         "logs/runner_events.jsonl, shadow_decisions files, "
+                         "and (pre-2026-07-27) the heartbeat file.")
     args = ap.parse_args(argv)
 
     chk = Check()
@@ -305,8 +391,7 @@ def main(argv=None) -> int:
     _check_repo_and_venv(chk)
     _check_git_state(chk, args.require_clean_git)
     _check_config_hashes(chk)
-    _check_no_competing_runner(chk)
-    _check_collection_service_inactive(chk)
+    _check_isolated_run(chk, args.require_isolated_run)
     _check_dirs(chk)
     _check_disk_space(chk)
     _check_data_files(chk)
