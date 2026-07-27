@@ -91,6 +91,14 @@ def _install_signal_handlers() -> None:
             pass
 
 
+# Set once by run_bot() right after computing this session's provenance, so
+# every lifecycle event below is unambiguously attributable to a run_id even
+# though logs/runner_events.jsonl itself remains a single shared append-only
+# file (kept for compatibility; see docs/PROJECT_STATE.md "Run-scoped
+# outputs"). None until set (e.g. in a test importing this module directly).
+_CURRENT_RUN_ID: Optional[str] = None
+
+
 def log_runner_event(event_type: str, **fields) -> None:
     """
     Append a single structured lifecycle event to RUNNER_EVENTS_FILE.
@@ -101,6 +109,7 @@ def log_runner_event(event_type: str, **fields) -> None:
         "ts": round(time.time(), 3),
         "t": datetime.now(timezone.utc).isoformat(),
         "event_type": event_type,
+        "run_id": _CURRENT_RUN_ID,
     }
     record.update(fields)
     try:
@@ -154,8 +163,20 @@ class RunnerWatchdog:
     Runs in a separate thread inside the runner process.
     """
 
-    def __init__(self, child_pid_func, stale_threshold: int = STALE_THRESHOLD_SECONDS):
+    def __init__(self, child_pid_func, run_id: Optional[str] = None,
+                 active_child: Optional[dict] = None,
+                 stale_threshold: int = STALE_THRESHOLD_SECONDS):
         self.child_pid_func = child_pid_func  # callable that returns current child PID
+        # run_id + a live reference to the runner's own active_child dict
+        # ({"start_ts": ..., "restart_index": ...}) are what let the
+        # heartbeat check prove a heartbeat belongs to THIS run and THIS
+        # child before ever treating it as evidence of liveness (see
+        # _valid_heartbeat below and core/diagnostics/run_provenance.py).
+        # Optional only so tests exercising unrelated checks (e.g. journal
+        # staleness) don't need to construct full run identity; run_bot()
+        # always passes both.
+        self.run_id = run_id
+        self.active_child = active_child if active_child is not None else {}
         self.stale_threshold = stale_threshold
         self._stop_event = threading.Event()
         self._thread = None
@@ -209,28 +230,19 @@ class RunnerWatchdog:
         except PermissionError:
             pass  # Process exists but we can't signal it
 
-        # Check heartbeat freshness. Only a heartbeat written by the CURRENT
-        # run session counts; a leftover heartbeat from a PREVIOUS run is
-        # ignored so it cannot trigger a false heartbeat_stale restart while the
-        # child is still bootstrapping (before it writes its first fresh
-        # heartbeat). This mirrors the journal/shadow staleness scoping below.
-        # Real stalls are still caught: once a fresh heartbeat exists staleness
-        # applies normally, and a child that never produces a fresh heartbeat
-        # within a full stale window after run start is restarted as a genuine
-        # startup stall (heartbeat_never_fresh) rather than silently ignored.
-        heartbeat_age = self._get_file_age(
-            HEARTBEAT_FILE, min_mtime=self.run_start_ts
-        )
-        if heartbeat_age is not None and heartbeat_age > self.stale_threshold:
-            print(f"[WATCHDOG] Heartbeat stale for {heartbeat_age:.0f}s (threshold: {self.stale_threshold}s)")
-            self._restart_child(child_pid, "heartbeat_stale")
+        # Check heartbeat freshness via the run-owned heartbeat (never the
+        # legacy shared logs/bot_heartbeat.json -- see _valid_heartbeat).
+        # A heartbeat from a different run or an old child of THIS run is
+        # treated exactly like no heartbeat at all: it must never refresh
+        # liveness for a child it doesn't actually belong to. Real stalls
+        # are still caught the same way as before: once a valid, identity-
+        # matched heartbeat exists staleness applies normally, and a child
+        # that never produces one within a full stale window after its own
+        # start is restarted as a genuine startup stall (heartbeat_never_fresh).
+        heartbeat_reason = self._check_heartbeat(child_pid)
+        if heartbeat_reason:
+            self._restart_child(child_pid, heartbeat_reason)
             return
-        if heartbeat_age is None and self.run_start_ts is not None:
-            startup_age = time.time() - self.run_start_ts
-            if startup_age > self.stale_threshold:
-                print(f"[WATCHDOG] No fresh heartbeat {startup_age:.0f}s after run start (threshold: {self.stale_threshold}s)")
-                self._restart_child(child_pid, "heartbeat_never_fresh")
-                return
 
         # Check journal freshness. Only consider journal files from the CURRENT
         # run session; files from previous runs/days are ignored. If no
@@ -243,6 +255,50 @@ class RunnerWatchdog:
             print(f"[WATCHDOG] Journal stale for {journal_age:.0f}s")
             self._restart_child(child_pid, "journal_stale")
             return
+
+    def _valid_heartbeat(self, child_pid: int):
+        """Read the run-owned heartbeat (logs/runs/<run_id>/heartbeat.json)
+        and validate its identity against THIS watchdog's own run and
+        current child. Returns (heartbeat_dict, None) only when the
+        heartbeat unambiguously belongs here; otherwise (None, reason) --
+        a heartbeat from another run or an old child of this run must never
+        be treated as evidence this child is alive."""
+        hb = run_provenance.read_heartbeat(project_root, self.run_id)
+        if hb is None:
+            return None, "heartbeat_missing"
+        if hb.get("run_id") != self.run_id or hb.get("runner_pid") != os.getpid():
+            return None, "heartbeat_wrong_run"
+        # child_generation is set into the child's environment as a string
+        # (env vars are always strings), so compare as strings on both
+        # sides rather than risk a str/int mismatch.
+        expected_generation = str(self.active_child.get("restart_index"))
+        if hb.get("child_pid") != child_pid or str(hb.get("child_generation")) != expected_generation:
+            return None, "heartbeat_wrong_child"
+        expected_start_ts = self.active_child.get("start_ts")
+        hb_ts = hb.get("timestamp")
+        if expected_start_ts is not None and (hb_ts is None or hb_ts < expected_start_ts):
+            return None, "heartbeat_wrong_child"
+        return hb, None
+
+    def _check_heartbeat(self, child_pid: int) -> Optional[str]:
+        """Return a watchdog restart reason if the CURRENT child has no
+        valid, fresh, identity-matched heartbeat -- else None."""
+        hb, fail_reason = self._valid_heartbeat(child_pid)
+        if hb is not None:
+            age = time.time() - hb["timestamp"]
+            if age > self.stale_threshold:
+                print(f"[WATCHDOG] heartbeat_stale: {age:.0f}s (threshold: {self.stale_threshold}s)")
+                return "heartbeat_stale"
+            return None
+
+        print(f"[WATCHDOG] {fail_reason}: no valid run-owned heartbeat yet for child {child_pid}")
+        expected_start_ts = self.active_child.get("start_ts")
+        if expected_start_ts is not None:
+            startup_age = time.time() - expected_start_ts
+            if startup_age > self.stale_threshold:
+                print(f"[WATCHDOG] heartbeat_never_fresh: no valid heartbeat {startup_age:.0f}s after child start")
+                return "heartbeat_never_fresh"
+        return None
 
     def _get_file_age(self, filepath: str, min_mtime: Optional[float] = None) -> Optional[float]:
         """Get age of a file in seconds. Returns None if the file doesn't exist,
@@ -346,7 +402,8 @@ class RunnerWatchdog:
 
         # Gather diagnostic info before restart (scoped to the current run
         # session so the logged ages match what the health check evaluates).
-        heartbeat_age = self._get_file_age(HEARTBEAT_FILE)
+        _hb, _ = self._valid_heartbeat(child_pid)
+        heartbeat_age = (time.time() - _hb["timestamp"]) if _hb else None
         journal_age = self._get_newest_file_age(
             JOURNAL_DIR, "trade_journal_*.jsonl", min_mtime=self.run_start_ts
         )
@@ -371,15 +428,22 @@ class RunnerWatchdog:
 
         # Attribute this child's upcoming exit to the watchdog (by PID).
         self.last_restart = {"pid": child_pid, "ts": now, "reason": reason}
-        log_runner_event(
-            "watchdog_restart",
-            child_pid=child_pid,
-            reason=reason,
-            heartbeat_age_s=round(heartbeat_age, 1) if heartbeat_age is not None else None,
-            journal_age_s=round(journal_age, 1) if journal_age is not None else None,
-            shadow_age_s=round(shadow_age, 1) if shadow_age is not None else None,
-            diagnostics=diag_paths,
-        )
+        watchdog_event = {
+            "t": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            "child_pid": child_pid,
+            "reason": reason,
+            "heartbeat_age_s": round(heartbeat_age, 1) if heartbeat_age is not None else None,
+            "journal_age_s": round(journal_age, 1) if journal_age is not None else None,
+            "shadow_age_s": round(shadow_age, 1) if shadow_age is not None else None,
+            "diagnostics": diag_paths,
+        }
+        log_runner_event("watchdog_restart", **{k: v for k, v in watchdog_event.items() if k != "t"})
+        if self.run_id:
+            try:
+                run_provenance.append_watchdog_event(project_root, self.run_id, watchdog_event)
+            except Exception:
+                pass
 
         # Try graceful termination first
         try:
@@ -431,6 +495,8 @@ def run_bot():
         schema_version=_schema_version,
     )
     manifest_path = run_provenance.write_start_manifest(project_root, provenance)
+    global _CURRENT_RUN_ID
+    _CURRENT_RUN_ID = provenance["run_id"]
     _git = provenance["git"]
     _head_short = _git["head"][:12] if _git["head"] != run_provenance.UNAVAILABLE else run_provenance.UNAVAILABLE
     child_env = {**os.environ, **run_provenance.env_for_child(provenance)}
@@ -509,7 +575,11 @@ def run_bot():
     _install_signal_handlers()
 
     # Start runner-level watchdog
-    watchdog = RunnerWatchdog(child_pid_func=get_child_pid)
+    watchdog = RunnerWatchdog(
+        child_pid_func=get_child_pid,
+        run_id=provenance["run_id"],
+        active_child=active_child,
+    )
     watchdog.set_run_start(time.time())
     watchdog.start()
 
@@ -530,7 +600,14 @@ def run_bot():
 
             try:
                 cmd = [python_cmd, BOT_SCRIPT] + bot_args
-                process = subprocess.Popen(cmd, env=child_env)
+                # restart_count changes per child (unlike the rest of
+                # child_env, which is fixed for the whole run session) -- it
+                # is this child's "generation" for heartbeat identity checks.
+                this_child_env = {
+                    **child_env,
+                    f"{run_provenance.ENV_PREFIX}CHILD_GENERATION": str(restart_count),
+                }
+                process = subprocess.Popen(cmd, env=this_child_env)
                 current_child_pid[0] = process.pid
                 print(f"[RUNNER] Child PID: {process.pid}")
 

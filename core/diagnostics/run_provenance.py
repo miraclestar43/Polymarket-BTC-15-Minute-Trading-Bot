@@ -199,6 +199,117 @@ def write_end_manifest(
     return path
 
 
+def heartbeat_path(repo_root: Path, run_id: str) -> Path:
+    return repo_root / "logs" / "runs" / run_id / "heartbeat.json"
+
+
+def write_heartbeat(
+    repo_root: Path,
+    run_id: str,
+    runner_pid: int,
+    child_pid: int,
+    child_generation: Any,
+    child_start_ts: Optional[float],
+    event: str,
+    uptime_s: int,
+    git_head: str,
+    schema_version: Any,
+) -> Path:
+    """Run-owned heartbeat, written by the CHILD on every meaningful
+    progress event (quote tick, timer cycle, journal write -- never on an
+    independent timer, so a truly stuck event loop still stops producing
+    heartbeats). Atomic write; the payload is a small flat dict (bounded
+    size -- it is overwritten in place, never appended to). Carries enough
+    identity for the watchdog to prove a heartbeat belongs to THIS run and
+    THIS child before ever treating it as evidence of liveness."""
+    now = time.time()
+    payload = {
+        "run_id": run_id,
+        "runner_pid": runner_pid,
+        "child_pid": child_pid,
+        "child_generation": child_generation,
+        "child_start_ts": child_start_ts,
+        "timestamp": now,
+        "event": event,
+        "uptime_s": uptime_s,
+        "git_head": git_head,
+        "schema_version": schema_version,
+    }
+    path = heartbeat_path(repo_root, run_id)
+    write_json_atomic(path, payload)
+    return path
+
+
+def read_heartbeat(repo_root: Path, run_id: str) -> Optional[Dict[str, Any]]:
+    """Read the run-owned heartbeat, or None if it doesn't exist / can't be
+    parsed (never raises -- a missing or corrupt heartbeat is exactly the
+    "not yet proven alive" state the watchdog already has to handle)."""
+    path = heartbeat_path(repo_root, run_id)
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def watchdog_events_path(repo_root: Path, run_id: str) -> Path:
+    return repo_root / "logs" / "runs" / run_id / "watchdog_events.jsonl"
+
+
+def append_watchdog_event(repo_root: Path, run_id: str, record: Dict[str, Any]) -> Path:
+    """Run-scoped watchdog-diagnostics index: a small, append-only mirror of
+    this run's watchdog_restart events (which already carry diagnostics
+    file paths), so a future audit of THIS run doesn't have to grep the
+    shared logs/runner_events.jsonl for its run_id. Additive only -- the
+    shared log is unchanged and remains the source of truth; this is a
+    convenience index, not a migration."""
+    path = watchdog_events_path(repo_root, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    return path
+
+
+def run_abort_manifest_path(repo_root: Path, run_id: str) -> Path:
+    return repo_root / "logs" / "runs" / run_id / "abort_manifest.json"
+
+
+def write_abort_manifest(
+    repo_root: Path,
+    run_id: str,
+    status: str,
+    reason: str,
+    reason_detail: str,
+    start_timestamp: str,
+    stop_timestamp: str,
+    git_head: str,
+    record_count: int,
+    excluded_from_replication_metrics: bool = True,
+) -> Path:
+    """Separate, immutable classification manifest for a run that was
+    aborted/disqualified after the fact (e.g. an isolation violation
+    discovered post-hoc). Never mutates the original start/end manifests or
+    any raw record — this is purely an additional, explicit classification
+    record so a future audit does not have to re-derive why a run's data is
+    excluded."""
+    now = time.time()
+    abort = {
+        "run_id": run_id,
+        "status": status,
+        "start_timestamp": start_timestamp,
+        "stop_timestamp": stop_timestamp,
+        "reason": reason,
+        "reason_detail": reason_detail,
+        "git_head": git_head,
+        "shadow_decision_record_count": record_count,
+        "excluded_from_replication_metrics": excluded_from_replication_metrics,
+        "classified_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+        + f".{int((now % 1) * 1e6):06d}+00:00",
+    }
+    path = run_abort_manifest_path(repo_root, run_id)
+    write_json_atomic(path, abort)
+    return path
+
+
 def env_for_child(provenance: Dict[str, Any]) -> Dict[str, str]:
     """Environment-variable overlay to pass this run's provenance down to a
     freshly-spawned child process (merge onto os.environ, never replace

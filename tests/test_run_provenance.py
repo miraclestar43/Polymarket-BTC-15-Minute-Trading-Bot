@@ -285,3 +285,66 @@ def test_shadow_records_carry_run_provenance(tmp_path, monkeypatch):
         assert r["schema_version"] == se.SHADOW_SCHEMA_VERSION
         assert r["dry_run"] is True and r["simulation"] is True
     rp.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Aborted-pilot manifest classification (2026-07-27, isolation hardening)
+# ---------------------------------------------------------------------------
+def test_write_abort_manifest_classification(tmp_path):
+    path = rp.write_abort_manifest(
+        repo_root=tmp_path, run_id="run_1785102520_55073",
+        status="aborted_isolation_pilot",
+        reason="competing_week1_runner_and_shared_heartbeat_watchdog_masking",
+        reason_detail="ran alongside the still-active Week-1 runner",
+        start_timestamp="2026-07-26T21:48:40.853887+00:00",
+        stop_timestamp="2026-07-27T03:53:46.619962+00:00",
+        git_head="6106051c7d8385203fe3b719f1d07655470e948c",
+        record_count=360,
+    )
+    assert path == rp.run_abort_manifest_path(tmp_path, "run_1785102520_55073")
+    data = json.loads(path.read_text())
+    assert data["run_id"] == "run_1785102520_55073"
+    assert data["status"] == "aborted_isolation_pilot"
+    assert data["reason"] == "competing_week1_runner_and_shared_heartbeat_watchdog_masking"
+    assert data["shadow_decision_record_count"] == 360
+    assert data["excluded_from_replication_metrics"] is True
+    assert "classified_at" in data
+
+
+def test_abort_manifest_does_not_touch_start_or_end_manifest(tmp_path):
+    prov = {
+        "run_id": "run_X", "git": {"head": "abc", "branch": "main", "dirty": False},
+        "strategy_config_sha256": "deadbeef",
+    }
+    start_path = rp.write_start_manifest(tmp_path, prov)
+    start_before = start_path.read_text()
+    rp.write_abort_manifest(
+        repo_root=tmp_path, run_id="run_X", status="aborted_isolation_pilot",
+        reason="test", reason_detail="test", start_timestamp="t0",
+        stop_timestamp="t1", git_head="abc", record_count=0,
+    )
+    assert start_path.read_text() == start_before  # unchanged, separate file
+    assert not rp.run_manifest_end_path(tmp_path, "run_X").exists()
+
+
+def test_abort_manifest_excluded_flag_can_be_set_false(tmp_path):
+    path = rp.write_abort_manifest(
+        repo_root=tmp_path, run_id="run_Y", status="aborted_for_other_reason",
+        reason="test", reason_detail="test", start_timestamp="t0",
+        stop_timestamp="t1", git_head="abc", record_count=0,
+        excluded_from_replication_metrics=False,
+    )
+    assert json.loads(path.read_text())["excluded_from_replication_metrics"] is False
+
+
+# ---------------------------------------------------------------------------
+# Watchdog-diagnostics run-scoped index (additive, never a migration)
+# ---------------------------------------------------------------------------
+def test_append_watchdog_event_is_additive(tmp_path):
+    rp.append_watchdog_event(tmp_path, "run_Z", {"reason": "heartbeat_stale", "child_pid": 1})
+    rp.append_watchdog_event(tmp_path, "run_Z", {"reason": "heartbeat_stale", "child_pid": 2})
+    path = rp.watchdog_events_path(tmp_path, "run_Z")
+    lines = path.read_text().strip().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["child_pid"] == 1
+    assert json.loads(lines[1])["child_pid"] == 2

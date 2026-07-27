@@ -129,6 +129,34 @@ def _watchdog_with_root(monkeypatch, tmp_path):
     return runner.RunnerWatchdog(child_pid_func=lambda: 4242)
 
 
+_HB_RUN_ID = "run_test_runner_events"
+
+
+def _watchdog_with_identity(monkeypatch, tmp_path, child_start_ts, generation=1):
+    """A RunnerWatchdog with full run/child identity set, for tests that
+    need the (now identity-checked) heartbeat path to actually validate."""
+    (tmp_path / "logs").mkdir()
+    monkeypatch.setattr(runner, "project_root", tmp_path)
+    active_child = {"start_ts": child_start_ts, "restart_index": generation}
+    return runner.RunnerWatchdog(
+        child_pid_func=lambda: 4242, run_id=_HB_RUN_ID, active_child=active_child,
+    )
+
+
+def _write_matching_heartbeat(tmp_path, ts, generation=1):
+    from core.diagnostics import run_provenance as rp
+    import json
+    rp.write_heartbeat(
+        repo_root=tmp_path, run_id=_HB_RUN_ID, runner_pid=_os.getpid(),
+        child_pid=4242, child_generation=str(generation), child_start_ts=ts,
+        event="tick", uptime_s=0, git_head="deadbeef", schema_version=2,
+    )
+    path = rp.heartbeat_path(tmp_path, _HB_RUN_ID)
+    data = json.loads(path.read_text())
+    data["timestamp"] = ts
+    path.write_text(json.dumps(data))
+
+
 def test_old_journal_ignored_when_scoped_to_run_start(monkeypatch, tmp_path):
     wd = _watchdog_with_root(monkeypatch, tmp_path)
     logs = tmp_path / "logs"
@@ -155,15 +183,17 @@ def test_current_run_journal_is_seen(monkeypatch, tmp_path):
 
 
 def test_check_health_does_not_restart_on_old_journal(monkeypatch, tmp_path):
-    wd = _watchdog_with_root(monkeypatch, tmp_path)
+    base = _time.time()
+    wd = _watchdog_with_identity(monkeypatch, tmp_path, child_start_ts=base)
     logs = tmp_path / "logs"
-    # Fresh heartbeat (healthy), but only an OLD journal from a previous run.
-    hb = logs / "bot_heartbeat.json"
-    hb.write_text("{}")  # fresh mtime
+    # Fresh, correctly-identified run-owned heartbeat (healthy), but only an
+    # OLD journal from a previous run.
+    _write_matching_heartbeat(tmp_path, ts=base + 5)
     _make_journal(logs, "trade_journal_2026-06-15.jsonl", age_seconds=10000)
-    wd.set_run_start(_time.time())
+    wd.set_run_start(base)
 
     monkeypatch.setattr(runner.os, "kill", lambda *a, **k: None)  # child "alive"
+    monkeypatch.setattr(runner.time, "time", lambda: base + 10)
     calls = []
     monkeypatch.setattr(wd, "_restart_child", lambda pid, reason: calls.append(reason))
 
@@ -172,17 +202,13 @@ def test_check_health_does_not_restart_on_old_journal(monkeypatch, tmp_path):
 
 
 def test_check_health_still_restarts_on_stale_heartbeat(monkeypatch, tmp_path):
-    wd = _watchdog_with_root(monkeypatch, tmp_path)
-    logs = tmp_path / "logs"
-    hb = logs / "bot_heartbeat.json"
-    hb.write_text("{}")
     base = _time.time()
+    wd = _watchdog_with_identity(monkeypatch, tmp_path, child_start_ts=base)
     wd.set_run_start(base)
-    # A FRESH heartbeat written by THIS run (after run start) that then goes
-    # stale. A heartbeat older than run_start is a prior-run artifact and is
-    # intentionally ignored (see test_watchdog_startup_falsepositive).
+    # A FRESH, correctly-identified heartbeat written by THIS run's current
+    # child that then goes stale.
     fresh = base + 10
-    _os.utime(hb, (fresh, fresh))
+    _write_matching_heartbeat(tmp_path, ts=fresh)
     monkeypatch.setattr(runner.time, "time",
                         lambda: fresh + runner.STALE_THRESHOLD_SECONDS + 600)
 
@@ -192,5 +218,42 @@ def test_check_health_still_restarts_on_stale_heartbeat(monkeypatch, tmp_path):
 
     wd._check_health()
     assert calls == ["heartbeat_stale"]  # genuine stall still detected
+
+
+# ---------------------------------------------------------------------------
+# run_id must be present on every new lifecycle event (2026-07-27 isolation
+# hardening) -- logs/runner_events.jsonl stays a single shared file, but
+# every record must be unambiguously attributable to a run_id so it can be
+# scoped correctly even while another run is concurrently appending to the
+# same file (exactly what happened with run_1785102520_55073).
+# ---------------------------------------------------------------------------
+def test_log_runner_event_carries_current_run_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "project_root", tmp_path)
+    monkeypatch.setattr(runner, "_CURRENT_RUN_ID", "run_TEST_123")
+    for event_type, kwargs in [
+        ("runner_start", {"pid": 1}),
+        ("child_start", {"child_pid": 2, "restart_index": 1}),
+        ("child_exit", {"child_pid": 2, "restart_index": 1, "exit_code": 0}),
+        ("watchdog_restart", {"child_pid": 2, "reason": "heartbeat_stale"}),
+        ("runner_stop", {"pid": 1, "signal": "SIGTERM"}),
+    ]:
+        runner.log_runner_event(event_type, **kwargs)
+
+    lines = (tmp_path / "logs" / "runner_events.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 5
+    import json
+    for line in lines:
+        rec = json.loads(line)
+        assert rec["run_id"] == "run_TEST_123"
+
+
+def test_log_runner_event_run_id_none_before_run_bot_sets_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "project_root", tmp_path)
+    monkeypatch.setattr(runner, "_CURRENT_RUN_ID", None)
+    runner.log_runner_event("child_start", child_pid=1)
+    import json
+    rec = json.loads((tmp_path / "logs" / "runner_events.jsonl").read_text().strip())
+    assert rec["run_id"] is None  # explicit, not a crash or a missing key
+    assert "run_id" in rec
 
 

@@ -76,6 +76,7 @@ from core.strategy_brain.regime.aggregator import get_and_persist_regime
 from core.market_data.dual_book import DualBookStore
 from core.strategy_brain.market_resolver import get_market_resolver
 from core.diagnostics import runtime_diag as diag
+from core.diagnostics import run_provenance as run_provenance_mod
 from notifications.telegram_notifier import send_telegram_message, is_configured as tg_is_configured
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
@@ -108,20 +109,62 @@ class HealthWatchdog:
     DEFAULT_STALE_MINUTES = 45
 
     def __init__(self, heartbeat_path: str, stale_minutes: int = DEFAULT_STALE_MINUTES):
+        # Legacy shared path -- kept as an OPTIONAL compatibility output only
+        # (e.g. `tail -f` during manual debugging). The runner watchdog no
+        # longer reads this file: a run-scoped, identity-checked heartbeat
+        # under logs/runs/<run_id>/heartbeat.json is authoritative instead,
+        # because a single shared heartbeat file can be refreshed by ANY
+        # concurrently-running child (even from a different run session),
+        # masking a real stall in the child the watchdog is actually
+        # supposed to be monitoring. See core/diagnostics/run_provenance.py.
         self.heartbeat_path = Path(heartbeat_path)
         self.stale_minutes = stale_minutes
         self._last_heartbeat = time.time()
         self._thread = None
         self._stop = threading.Event()
+        self._repo_root = Path(__file__).parent
+        # Run/child identity, resolved ONCE here (env vars set once by the
+        # runner at its own startup; os.getppid()/os.getpid() are free) --
+        # never a Git call or extra file I/O per heartbeat.
+        prov = run_provenance_mod.get_current_run_provenance()
+        self._run_id = prov["run_id"]
+        self._runner_pid = os.getppid()
+        self._child_pid = os.getpid()
+        self._child_generation = os.getenv(
+            f"{run_provenance_mod.ENV_PREFIX}CHILD_GENERATION",
+            run_provenance_mod.UNAVAILABLE,
+        )
+        self._git_head = prov["git_head"]
+        self._schema_version = os.getenv(
+            f"{run_provenance_mod.ENV_PREFIX}SCHEMA_VERSION",
+            run_provenance_mod.UNAVAILABLE,
+        )
 
     def heartbeat(self, event: str = "tick"):
-        """Update heartbeat timestamp and write to file."""
+        """Update heartbeat timestamp and write to file(s)."""
         self._last_heartbeat = time.time()
+        uptime_s = int(time.time() - self._start_time) if hasattr(self, '_start_time') else 0
+        if self._run_id != run_provenance_mod.UNAVAILABLE:
+            try:
+                run_provenance_mod.write_heartbeat(
+                    repo_root=self._repo_root,
+                    run_id=self._run_id,
+                    runner_pid=self._runner_pid,
+                    child_pid=self._child_pid,
+                    child_generation=self._child_generation,
+                    child_start_ts=getattr(self, "_start_time", None),
+                    event=event,
+                    uptime_s=uptime_s,
+                    git_head=self._git_head,
+                    schema_version=self._schema_version,
+                )
+            except Exception:
+                pass
         try:
             self.heartbeat_path.write_text(json.dumps({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "event": event,
-                "uptime_s": int(time.time() - self._start_time) if hasattr(self, '_start_time') else 0,
+                "uptime_s": uptime_s,
             }))
         except Exception:
             pass
