@@ -1,71 +1,144 @@
 """
-Patch: aggregate the high-volume "Dropping QuoteTick" WARNING into periodic,
-rate-limited summaries — LOGGING ONLY, never touches quote acceptance or
-rejection behavior.
+Quote-tick warning volume — diagnostic capability check only.
 
-Root cause (read-only traced, vendored code, NOT modified):
-  .venv/lib/python3.12/site-packages/nautilus_trader/adapters/polymarket/data.py
-  PolymarketDataClient._handle_quote() intentionally drops a QuoteTick and
-  logs
-    self._log.warning(f"Dropping QuoteTick for {id}: bid_price=..., ask_price=...")
-  whenever one side of the book is missing and
-  config.drop_quotes_missing_side=True (our deployed config) — expected,
-  defensive behavior near market open/resolution or thin top-of-book
-  liquidity. `_handle_book_snapshot()` logs a related, much lower-volume
-  message for the same reason on full snapshots.
+============================================================================
+HISTORY / WHY THIS FILE LOOKS THE WAY IT DOES
+============================================================================
+The original version of this patch (commit ea4c5a9) attempted:
 
-Verified in the Week-2 run (run_1785129217_59916): 4,121,924 of these
-warnings over the run's lifetime (~8.6/s, ~1.3GB of estimated journal
-storage), with ZERO data-integrity or watchdog impact — a real
-operational/logging-volume concern only, not a data-handling defect.
+    self._log = _QuoteDropAggregator(self._log)
 
-This patch wraps ONLY the DataClient's own Logger instance, at the
-attribute level, after the real client is fully constructed. It never
-touches `_handle_quote`, `_handle_book_snapshot`, book/quote acceptance-or-
-rejection logic, or any other Nautilus method — the exact same quotes are
-still dropped, under the exact same conditions, with the exact same
-`return` behavior, as before this patch. Only how the resulting WARNING
-text reaches the log is changed:
-  - the FIRST time a given (instrument, missing-side reason) is seen, it is
-    logged immediately and in full — a brand-new rejection signature is
-    never hidden or delayed;
-  - subsequent occurrences of an already-seen (instrument, reason) are
-    counted and rolled up into one periodic INFO summary line per
-    QUOTE_DROP_SUMMARY_INTERVAL_S seconds, grouped by reason;
-  - any OTHER log message (including a future, differently-worded warning
-    from this same component) is passed straight through, unmodified and
-    immediately — never delayed, never aggregated.
+inside a wrapped PolymarketDataClient.__init__, to transparently proxy the
+DataClient's Logger and aggregate its high-volume "Dropping QuoteTick"
+WARNING (4,121,924 occurrences over the Week-2 run, ~8.6/s, ~1.3GB
+estimated journal storage — a real operational/logging-volume concern,
+never a data-integrity one).
+
+That design crashed EVERY child of the Week-3 launch attempt
+(run_1785613687_96724, 2026-08-01T19:48:07.412Z / 12:48:07 PDT) during
+TradingNode.build(), inside PolymarketDataClient.__init__:
+
+    AttributeError: attribute '_log' of 'nautilus_trader.common.component.Component'
+    objects is not writable
+
+Root cause, confirmed against the REAL installed types (not the hand-written
+fake-logger test double used previously):
+
+  - nautilus_trader/common/component.pxd declares, on the Component base
+    class every Nautilus client inherits from:
+        cdef readonly Logger _log
+    `readonly` is a genuine, compiled, permanent Cython restriction —
+    `self._log = anything` can NEVER succeed on a real instance, regardless
+    of construction order. It is not a not-yet-initialized issue.
+  - Logger itself (also `cdef class`, also in component.pxd/.pyx) has NO
+    Python `__dict__` (`hasattr(Logger(...), '__dict__')` is False) and its
+    TYPE is immutable at the Python level:
+        >>> Logger.warning = something
+        TypeError: cannot set 'warning' attribute of immutable type
+        'nautilus_trader.common.component.Logger'
+    So neither per-instance attribute injection NOR class-level method
+    replacement is possible for Logger. There is no supported extension
+    point on this type in the installed nautilus_trader version.
+
+By contrast, PolymarketDataClient itself (nautilus_trader/adapters/
+polymarket/data.py) is a PLAIN PYTHON class (not compiled Cython) that
+subclasses the Cython Component hierarchy — its own methods, including
+__init__ and _handle_quote, ARE reassignable at the class level (this is
+exactly how patch_market_orders.py already safely patches
+PolymarketExecutionClient._submit_market_order). Its instances also DO get
+a normal `__dict__` (proven by the existing, working vendor code:
+`self._config = config`, `self._http_client = http_client` in
+PolymarketDataClient.__init__ are plain dynamic attributes, not `cdef`
+slots).
+
+Given that, the ONLY narrow interposition point left is
+PolymarketDataClient._handle_quote (a plain Python method). Its relevant
+branch (data.py, inside _handle_quote) is:
+
+    if bid_price is None or ask_price is None:
+        if self._config.drop_quotes_missing_side:
+            self._log.warning(
+                f"Dropping QuoteTick for {instrument.id}: "
+                f"bid_price={bid_price}, ask_price={ask_price}",
+            )
+            return
+        else:
+            ... (boundary-price substitution path; not our target)
+
+This IS an ordinary Python `if` block, and _handle_quote as a whole IS
+patchable -- but the specific self._log.warning(...) call inside it cannot
+be intercepted, suppressed, or redirected without either:
+
+  (a) duplicating the missing-side detection ("bid_price = local_book.
+      best_bid_price(); ask_price = local_book.best_ask_price()") in a
+      wrapper that runs BEFORE calling the original, so it can decide
+      whether to call the original at all. This is a real correctness
+      risk, not a cosmetic one: the original applies THIS tick's book
+      delta (`local_book.apply(deltas)`) BEFORE checking bid/ask, so a
+      naive pre-check reads the book's state from BEFORE this tick's
+      delta is applied -- one tick stale relative to what the original
+      actually evaluates. Getting this wrong could misclassify a tick
+      that the original would have accepted (or vice versa).
+  (b) copying the entire method body (replicating book-delta application,
+      quote construction, and the last-quote dedup check) so our own
+      warning call sits in the exact place the original's does.
+
+Both (a) and (b) mean duplicating verified vendor decision logic, which
+this project's stated policy is not to do without a separate, explicit,
+reviewed decision ("stop and report before implementing it" -- see the
+accompanying investigation report). So this file currently implements
+NEITHER: it performs a read-only, side-effect-free capability check and
+otherwise changes NOTHING about PolymarketDataClient. Quote acceptance and
+rejection behavior, and the original per-tick "Dropping QuoteTick" WARNING
+volume, are both completely unchanged from the pre-ea4c5a9 baseline.
+
+============================================================================
+WHAT THIS FILE DOES NOW
+============================================================================
+- apply_quote_tick_logging_patch() performs a read-only capability check
+  (no instances constructed, no I/O, no exceptions expected) and logs ONE
+  clear, explicit diagnostic explaining that aggregation is not enabled and
+  why. It never touches PolymarketDataClient.__init__, _handle_quote,
+  _handle_book_snapshot, or any Component/Logger attribute.
+- The `_QuoteDropAggregator` counting/aggregation algorithm from the
+  original design is KEPT (unit-tested, unchanged) because its logic
+  (first-occurrence-immediate, periodic per-reason summaries) is sound and
+  reusable -- only the INTEGRATION point (assigning Component._log) was
+  broken. It is DORMANT: nothing in this module currently constructs or
+  wires it into a live client. A future change that safely wires it in
+  (e.g. against a Nautilus version where Logger supports extension, or
+  after an explicit, reviewed decision to duplicate the narrow detection
+  branch with the staleness issue handled) can reuse it directly.
 """
 import logging
-import os
 import threading
 import time
+from types import FunctionType
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 _patch_applied = False
+_last_capabilities: Optional[Dict[str, Any]] = None
 
 _DROP_PREFIX = "Dropping QuoteTick for "
+SUMMARY_INTERVAL_S = 60.0
 
-# How often to flush an aggregated summary of suppressed duplicate warnings.
-# Overridable via env for testing; 60s in production is a reasonable balance
-# between log volume and freshness.
-SUMMARY_INTERVAL_S = float(os.getenv("QUOTE_DROP_SUMMARY_INTERVAL_S", "60"))
-
-# Live aggregator instances, kept only so tests / diagnostics can force a
-# flush; never used to share state ACROSS instances or process generations.
+# Kept for future reuse; not wired into any live interception point (see
+# module docstring). Isolated unit tests below use a fake logger to prove
+# this algorithm's own correctness -- that is legitimate and unaffected by
+# this file's decision not to attach it to the real Logger.
 _active_aggregators = []
 
 
 class _QuoteDropAggregator:
-    """Thread-safe transparent proxy around a real Nautilus ``Logger``.
+    """Thread-safe transparent proxy around a Logger-shaped object (real or
+    fake). Intercepts only messages starting with ``_DROP_PREFIX``;
+    everything else is forwarded unchanged. Never raises: a failure in the
+    aggregation path falls back to logging the message immediately.
 
-    Intercepts only messages starting with ``_DROP_PREFIX``; everything
-    else (info/debug/error, and any warning with different text) is
-    forwarded to the real logger unchanged. Never raises: a failure in the
-    aggregation path falls back to logging the message immediately, exactly
-    as the unpatched client would have.
+    NOT currently constructed against any real Component._log (see module
+    docstring for why) -- covered here purely as a unit-tested algorithm.
     """
 
     def __init__(self, real_log: Any, interval_s: float = SUMMARY_INTERVAL_S):
@@ -78,8 +151,6 @@ class _QuoteDropAggregator:
         _active_aggregators.append(self)
 
     def __getattr__(self, name):
-        # Transparent proxy for everything we don't explicitly override
-        # (info, debug, error, .name, ...) -> the real Logger, unchanged.
         return getattr(self._real_log, name)
 
     def warning(self, message: str, color: Optional[Any] = None) -> None:
@@ -89,7 +160,6 @@ class _QuoteDropAggregator:
                 return
             self._handle_drop_warning(message, color)
         except Exception:
-            # Aggregation must never suppress a real warning outright.
             self._forward_warning(message, color)
 
     def _forward_warning(self, message, color):
@@ -108,17 +178,10 @@ class _QuoteDropAggregator:
                 self._counts[key] = self._counts.get(key, 0) + 1
             self._maybe_flush_locked()
         if first_time:
-            # Always visible promptly: a brand-new (instrument, reason)
-            # combination is never delayed or hidden by aggregation.
             self._forward_warning(message, color)
 
     @staticmethod
     def _extract_reason_key(message: str) -> str:
-        """Group by instrument id + which side(s) were missing, e.g.
-        "Dropping QuoteTick for <id>: bid_price=None, ask_price=0.5"
-        -> "<id>|bid_missing". Falls back to the raw message as the key if
-        the text doesn't match the expected shape (still counted, never
-        dropped)."""
         try:
             rest = message[len(_DROP_PREFIX):]
             instrument_id, fields = rest.split(":", 1)
@@ -161,58 +224,96 @@ class _QuoteDropAggregator:
         self._counts.clear()
 
     def flush(self) -> None:
-        """Force an immediate flush of any pending suppressed count. Safe
-        to call at any time (e.g. before shutdown); a no-op if there is
-        nothing pending."""
         with self._lock:
             self._flush_locked()
 
 
 def flush_all() -> None:
-    """Flush every aggregator created by this patch in the current process
-    (there is normally exactly one, for the single PolymarketDataClient
-    instance). Diagnostic convenience only; never required for safety."""
     for agg in list(_active_aggregators):
         agg.flush()
 
 
-def apply_quote_tick_logging_patch() -> bool:
-    """Wrap PolymarketDataClient.__init__ so every constructed instance's
-    logger aggregates the high-volume "Dropping QuoteTick" warning.
-
-    Never touches _handle_quote, _handle_book_snapshot, or any book/quote
-    acceptance-or-rejection logic — only the Logger attribute used for this
-    one message pattern is replaced with a transparent, aggregating proxy.
-    """
-    global _patch_applied
-    if _patch_applied:
-        logger.info("Quote-tick logging patch already applied")
-        return True
-
+def _detect_capabilities() -> Dict[str, Any]:
+    """Read-only, side-effect-free introspection of the installed
+    nautilus_trader version's relevant types. Constructs NO client
+    instances, makes NO network calls, reads NO credentials. Used only to
+    produce an accurate diagnostic message; the result never changes
+    behavior in this version of the file (see module docstring)."""
+    caps: Dict[str, Any] = {
+        "handle_quote_importable": False,
+        "handle_quote_is_plain_python_method": False,
+        "component_log_descriptor": None,
+        "logger_type_is_mutable": None,
+    }
     try:
         from nautilus_trader.adapters.polymarket.data import PolymarketDataClient
-
-        _original_init = PolymarketDataClient.__init__
-
-        def _patched_init(self, *args, **kwargs):
-            _original_init(self, *args, **kwargs)
-            # Defense in depth: even if __init__ were ever invoked more than
-            # once on the same instance, never wrap an already-wrapped
-            # logger (would nest proxies and double-count/double-emit).
-            if not isinstance(self._log, _QuoteDropAggregator):
-                self._log = _QuoteDropAggregator(self._log)
-
-        PolymarketDataClient.__init__ = _patched_init
-        _patch_applied = True
-        logger.info(
-            "Quote-tick logging patch applied — 'Dropping QuoteTick' warnings "
-            f"aggregated into periodic summaries every {SUMMARY_INTERVAL_S:.0f}s "
-            "(quote acceptance/rejection behavior unchanged)"
-        )
-        return True
-    except ImportError as e:
-        logger.error(f"Failed to import required modules: {e}")
-        return False
+        caps["handle_quote_importable"] = True
+        raw = PolymarketDataClient.__dict__.get("_handle_quote")
+        caps["handle_quote_is_plain_python_method"] = isinstance(raw, FunctionType)
     except Exception as e:
-        logger.error(f"Failed to apply quote-tick logging patch: {e}")
+        caps["import_error"] = f"{type(e).__name__}: {e}"
+        return caps
+
+    try:
+        from nautilus_trader.common.component import Component, Logger
+        descriptor = Component.__dict__.get("_log")
+        caps["component_log_descriptor"] = type(descriptor).__name__ if descriptor is not None else None
+        # Cheap, safe probe: attempting to set a class-level attribute on an
+        # immutable extension type raises TypeError without constructing or
+        # mutating any real instance.
+        try:
+            Logger.warning = Logger.warning  # no-op assignment of the same value
+            caps["logger_type_is_mutable"] = True
+        except TypeError:
+            caps["logger_type_is_mutable"] = False
+    except Exception as e:
+        caps["introspection_error"] = f"{type(e).__name__}: {e}"
+
+    return caps
+
+
+def apply_quote_tick_logging_patch() -> bool:
+    """Read-only capability check + diagnostic log. Never patches
+    PolymarketDataClient.__init__, _handle_quote, _handle_book_snapshot, or
+    any Component/Logger attribute -- see module docstring for the full
+    investigation behind this decision. Idempotent: repeated calls in the
+    same or a fresh child process are safe and cannot accumulate state or
+    emit the diagnostic more than once per process.
+
+    Returns True if the check ran without an unexpected error (this is the
+    expected, safe outcome even though aggregation is not enabled).
+    Returns False only if nautilus_trader itself could not be imported at
+    all -- an environment problem unrelated to this patch's own logic.
+    """
+    global _patch_applied, _last_capabilities
+    if _patch_applied:
+        logger.info("Quote-tick logging capability check already performed (no-op)")
+        return True
+
+    caps = _detect_capabilities()
+    _last_capabilities = caps
+    _patch_applied = True
+
+    if not caps.get("handle_quote_importable"):
+        logger.error(
+            "Quote-tick logging patch: could not import "
+            "nautilus_trader.adapters.polymarket.data.PolymarketDataClient "
+            f"({caps.get('import_error')}). Original per-tick warning "
+            "behavior is unaffected either way; quote handling is untouched."
+        )
         return False
+
+    logger.info(
+        "Quote-tick logging: aggregation is NOT enabled. Component._log is a "
+        f"read-only Cython attribute (descriptor type: "
+        f"{caps.get('component_log_descriptor')}) and Logger is a sealed "
+        f"extension type (mutable at the Python level: "
+        f"{caps.get('logger_type_is_mutable')}), so no safe interception "
+        "point exists without duplicating vendor detection logic -- which "
+        "this patch declines to do without a separate, explicit decision. "
+        "Falling back to the ORIGINAL, unaggregated 'Dropping QuoteTick' "
+        "per-tick warning behavior. This is an expected, deliberate "
+        "fallback, not an error, and does not change quote acceptance or "
+        "rejection behavior in any way."
+    )
+    return True
