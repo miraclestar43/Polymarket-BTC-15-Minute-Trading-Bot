@@ -89,6 +89,16 @@ if patch_applied:
 else:
     logger.warning("Market order patch failed - orders may be rejected")
 
+from patch_quote_tick_logging import apply_quote_tick_logging_patch
+quote_log_patch_applied = apply_quote_tick_logging_patch()
+if quote_log_patch_applied:
+    logger.info("Quote-tick logging patch applied successfully")
+else:
+    logger.warning(
+        "Quote-tick logging patch failed - Dropping QuoteTick warnings will "
+        "not be aggregated (data handling is unaffected either way)"
+    )
+
 
 # =============================================================================
 # CONSTANTS
